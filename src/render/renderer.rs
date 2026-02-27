@@ -203,14 +203,24 @@ impl MolRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cylinder.wgsl").into()),
         });
 
-        use crate::render::rep_sticks::CylinderVertex;
-        let mesh_vertex_layout = wgpu::VertexBufferLayout {
+        use crate::render::rep_sticks::{CylinderVertex, StickInstance};
+        let stick_mesh_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<CylinderVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
-                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },  // position
+                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // position
                 wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // normal
-                wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // color
+            ],
+        };
+
+        let stick_instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<StickInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // start
+                wgpu::VertexAttribute { offset: 16, shader_location: 3, format: wgpu::VertexFormat::Float32x3 }, // end
+                wgpu::VertexAttribute { offset: 32, shader_location: 4, format: wgpu::VertexFormat::Float32x3 }, // color
+                wgpu::VertexAttribute { offset: 44, shader_location: 5, format: wgpu::VertexFormat::Float32 },   // radius
             ],
         };
 
@@ -220,7 +230,7 @@ impl MolRenderer {
             vertex: wgpu::VertexState {
                 module: &stick_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[mesh_vertex_layout.clone()],
+                buffers: &[stick_mesh_layout, stick_instance_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -250,13 +260,24 @@ impl MolRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cartoon.wgsl").into()),
         });
 
+        use crate::render::rep_cartoon::CartoonVertex;
+        let cartoon_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<CartoonVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // position
+                wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // normal
+                wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // color
+            ],
+        };
+
         let cartoon_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cartoon_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &cartoon_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[mesh_vertex_layout],
+                buffers: &[cartoon_vertex_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -291,7 +312,7 @@ impl MolRenderer {
             sphere_pipeline,
             sphere_rep: SphereRep::new(),
             stick_pipeline,
-            stick_rep: StickRep::new(),
+            stick_rep: StickRep::new(device),
             cartoon_pipeline,
             cartoon_rep: CartoonRep::new(),
         }
@@ -390,7 +411,7 @@ impl MolRenderer {
 
         let has_anything = self.line_vertex_count > 0
             || self.sphere_rep.instance_count > 0
-            || self.stick_rep.index_count > 0
+            || self.stick_rep.instance_count > 0
             || self.cartoon_rep.index_count > 0;
 
         if !has_anything {
@@ -445,13 +466,14 @@ impl MolRenderer {
         }
 
         // Draw sticks
-        if self.stick_rep.index_count > 0 {
-            if let (Some(vb), Some(ib)) = (&self.stick_rep.vertex_buffer, &self.stick_rep.index_buffer) {
+        if self.stick_rep.instance_count > 0 {
+            if let Some(ib) = &self.stick_rep.instance_buffer {
                 rpass.set_pipeline(&self.stick_pipeline);
                 rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                rpass.set_vertex_buffer(0, vb.slice(..));
-                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..self.stick_rep.index_count, 0, 0..1);
+                rpass.set_vertex_buffer(0, self.stick_rep.vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ib.slice(..));
+                rpass.set_index_buffer(self.stick_rep.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.stick_rep.index_count, 0, 0..self.stick_rep.instance_count);
             }
         }
 

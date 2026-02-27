@@ -15,3 +15,19 @@ pub struct ResidueRange {
     /// Index of the CA atom within the molecule's atom array, if present.
     pub ca_index: Option<usize>,
 }
+
+pub fn is_protein(resn: &str) -> bool {
+    matches!(
+        resn.trim().to_uppercase().as_str(),
+        "ALA" | "ARG" | "ASN" | "ASP" | "CYS" | "GLN" | "GLU" | "GLY" | "HIS" | "ILE" |
+        "LEU" | "LYS" | "MET" | "PHE" | "PRO" | "SER" | "THR" | "TRP" | "TYR" | "VAL" |
+        "ASX" | "GLX" | "UNK" | "MSE"
+    )
+}
+
+pub fn is_nucleic(resn: &str) -> bool {
+    matches!(
+        resn.trim().to_uppercase().as_str(),
+        "A" | "C" | "G" | "T" | "U" | "DA" | "DC" | "DG" | "DT" | "DU"
+    )
+}

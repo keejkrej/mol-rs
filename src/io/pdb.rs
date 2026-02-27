@@ -30,11 +30,29 @@ pub fn parse_pdb_string(content: &str, path: &Path) -> Result<Molecule, String> 
     // Secondary structure assignments: (chain, start_resi, end_resi, SSType)
     let mut ss_assignments: Vec<(char, i32, i32, SSType)> = Vec::new();
 
+    let mut current_model = 1;
+
     for line in content.lines() {
         let rec = if line.len() >= 6 { &line[..6] } else { line };
 
         match rec.trim() {
+            "MODEL" => {
+                if let Some(num_str) = line.get(10..14) {
+                    if let Ok(num) = num_str.trim().parse::<i32>() {
+                        current_model = num;
+                    }
+                }
+            }
+            "ENDMDL" => {
+                // If we just finished model 1, ensure we don't accidentally read more if next MODEL tag is missing (rare)
+                // But mainly we rely on MODEL tag updates.
+                // If we want to strictly support only 1 model for now, we could break here if current_model was 1.
+                // But let's stick to skipping atoms if model > 1.
+            }
             "ATOM" | "HETATM" => {
+                if current_model > 1 {
+                    continue;
+                }
                 if line.len() < 54 {
                     continue;
                 }
@@ -78,6 +96,9 @@ pub fn parse_pdb_string(content: &str, path: &Path) -> Result<Molecule, String> 
 
     // Build residue ranges
     mol.build_residues();
+
+    // Apply smart default representation (Cartoon for protein, Sticks for ligands, etc.)
+    mol.apply_default_representation();
 
     log::info!(
         "Loaded PDB: {} atoms, {} bonds, {} residues",
@@ -266,7 +287,7 @@ fn parse_sheet_line(line: &str) -> Option<(char, i32, i32, SSType)> {
 /// Infer covalent bonds based on inter-atomic distance.
 /// Uses a simple distance cutoff: bonded if dist < (vdw_a + vdw_b) * 0.6
 /// For efficiency, uses a spatial grid.
-fn infer_bonds(mol: &mut Molecule) {
+pub fn infer_bonds(mol: &mut Molecule) {
     let n = mol.atoms.len();
     if n == 0 {
         return;

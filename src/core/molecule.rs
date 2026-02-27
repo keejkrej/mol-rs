@@ -1,6 +1,6 @@
-use super::atom::AtomInfo;
+use super::atom::{AtomInfo, REP_CARTOON, REP_LINES, REP_STICKS};
 use super::bond::BondInfo;
-use super::residue::ResidueRange;
+use super::residue::{is_nucleic, is_protein, ResidueRange};
 use super::secondary_structure::SSType;
 
 /// A loaded molecular object, analogous to PyMOL's ObjectMolecule.
@@ -112,6 +112,39 @@ impl Molecule {
                 if atom.chain == chain && atom.resi >= start && atom.resi <= end {
                     atom.ss_type = ss;
                     break;
+                }
+            }
+        }
+    }
+
+    /// Apply a smart default representation based on residue type.
+    /// - Proteins: Cartoon
+    /// - Nucleic acids: Sticks (until cartoon is supported)
+    /// - Ligands/HETATM: Sticks
+    /// - Water: Lines (or hidden?)
+    /// - Others: Lines
+    pub fn apply_default_representation(&mut self) {
+        for atom in &mut self.atoms {
+            atom.vis_rep = 0; // Clear default
+
+            if atom.is_hetatm {
+                if atom.resn == "HOH" || atom.resn == "WAT" || atom.resn == "DOD" {
+                    // Water - keep it simple
+                    atom.vis_rep = REP_LINES;
+                } else {
+                    // Ligands / ions
+                    atom.vis_rep = REP_STICKS;
+                }
+            } else {
+                let is_prot = is_protein(&atom.resn);
+                let is_nuc = is_nucleic(&atom.resn);
+
+                if is_prot {
+                    atom.vis_rep = REP_CARTOON;
+                } else if is_nuc {
+                    atom.vis_rep = REP_STICKS;
+                } else {
+                    atom.vis_rep = REP_LINES;
                 }
             }
         }

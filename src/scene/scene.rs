@@ -2,8 +2,17 @@ use crate::core::molecule::Molecule;
 use crate::render::camera::Camera;
 use crate::scene::color::{ColorScheme, apply_color_scheme};
 
+#[derive(Debug, Clone)]
+pub struct Measurement {
+    pub p1: [f32; 3],
+    pub p2: [f32; 3],
+    pub distance: f32,
+    pub label: String,
+}
+
 pub struct Scene {
     pub molecules: Vec<Molecule>,
+    pub measurements: Vec<Measurement>,
     pub camera: Camera,
     pub color_scheme: ColorScheme,
     /// True when geometry buffers need rebuilding.
@@ -16,6 +25,7 @@ impl Default for Scene {
     fn default() -> Self {
         Self {
             molecules: Vec::new(),
+            measurements: Vec::new(),
             camera: Camera::default(),
             color_scheme: ColorScheme::ByElement,
             geometry_dirty: false,

@@ -15,7 +15,11 @@ struct Uniforms {
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) color: vec3<f32>,
+    // Instance attributes
+    @location(2) start: vec3<f32>,
+    @location(3) end: vec3<f32>,
+    @location(4) color: vec3<f32>,
+    @location(5) radius: f32,
 };
 
 struct VertexOutput {
@@ -28,10 +32,43 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
+
+    let axis_vec = in.end - in.start;
+    let len = length(axis_vec);
+    var dir = vec3<f32>(0.0, 1.0, 0.0);
+    if (len > 0.0001) {
+        dir = axis_vec / len;
+    }
+
+    // Build orthonormal basis
+    var temp_up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(dir.y) > 0.99) {
+        temp_up = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let right = normalize(cross(dir, temp_up));
+    let fwd = normalize(cross(right, dir));
+
+    // Transform position
+    // Local Y is along the stick axis (0 to 1)
+    // Local X and Z are radial
+    let p = in.position;
+    let pos_world = in.start 
+        + right * (p.x * in.radius) 
+        + dir * (p.y * len) 
+        + fwd * (p.z * in.radius);
+
+    // Transform normal
+    // Just rotate
+    let norm_world = normalize(
+          right * in.normal.x 
+        + dir * in.normal.y 
+        + fwd * in.normal.z
+    );
+
+    out.clip_pos = u.view_proj * vec4<f32>(pos_world, 1.0);
     out.color = in.color;
-    out.world_normal = in.normal;
-    out.world_pos = in.position;
+    out.world_normal = norm_world;
+    out.world_pos = pos_world;
     return out;
 }
 
