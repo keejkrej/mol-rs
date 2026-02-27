@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use eframe::egui_wgpu;
 use egui::{CentralPanel, SidePanel, TopBottomPanel};
 
+use crate::core::atom::{REP_LINES, REP_STICKS, REP_SPHERES, REP_CARTOON};
 use crate::io::pdb;
 use crate::render::renderer::MolRenderer;
 use crate::scene::scene::Scene;
+use crate::selection::{parse_selection, evaluate, evaluator::count_selected};
 use crate::ui::command_line::CommandLine;
 use crate::ui::control_panel;
 use crate::ui::object_panel;
@@ -129,20 +131,151 @@ impl MolApp {
         }
     }
 
-    fn handle_command(&mut self, cmd: &str) {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() {
-            return;
+    /// Parse "rep_name, selection_expr" from a comma-separated argument string.
+    /// If no comma, the entire string is the rep name and selection defaults to "all".
+    fn parse_rep_selection(args: &str) -> (String, String) {
+        if let Some(comma) = args.find(',') {
+            let rep = args[..comma].trim().to_lowercase();
+            let sel = args[comma + 1..].trim().to_string();
+            (rep, sel)
+        } else {
+            (args.trim().to_lowercase(), String::new())
         }
+    }
 
-        match parts[0] {
+    fn rep_flag(name: &str) -> Option<u32> {
+        match name {
+            "lines" | "line" => Some(REP_LINES),
+            "sticks" | "stick" => Some(REP_STICKS),
+            "spheres" | "sphere" => Some(REP_SPHERES),
+            "cartoon" => Some(REP_CARTOON),
+            _ => None,
+        }
+    }
+
+    fn parse_color(name: &str) -> Option<[f32; 3]> {
+        match name {
+            "red" => Some([1.0, 0.2, 0.2]),
+            "green" => Some([0.2, 1.0, 0.2]),
+            "blue" => Some([0.2, 0.2, 1.0]),
+            "yellow" => Some([1.0, 1.0, 0.2]),
+            "cyan" => Some([0.2, 1.0, 1.0]),
+            "magenta" => Some([1.0, 0.2, 1.0]),
+            "orange" => Some([1.0, 0.6, 0.2]),
+            "white" => Some([1.0, 1.0, 1.0]),
+            "gray" | "grey" => Some([0.5, 0.5, 0.5]),
+            "pink" => Some([1.0, 0.65, 0.85]),
+            "salmon" => Some([1.0, 0.6, 0.5]),
+            "purple" => Some([0.6, 0.2, 0.8]),
+            _ => None,
+        }
+    }
+
+    fn handle_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.splitn(2, char::is_whitespace).collect();
+        let verb = parts[0].to_lowercase();
+        let args = if parts.len() > 1 { parts[1].trim() } else { "" };
+
+        match verb.as_str() {
             "load" => {
-                if parts.len() < 2 {
+                if args.is_empty() {
                     self.command_line.log("Usage: load <filename>");
                 } else {
-                    let path = PathBuf::from(parts[1..].join(" "));
+                    let path = PathBuf::from(args);
                     self.load_file(path);
                 }
+            }
+            "show" => {
+                let (rep_name, sel_str) = Self::parse_rep_selection(args);
+                let flag = match Self::rep_flag(&rep_name) {
+                    Some(f) => f,
+                    None => {
+                        self.command_line.log(format!("Unknown rep: '{}'. Use lines/sticks/spheres/cartoon", rep_name));
+                        return;
+                    }
+                };
+                let sel = match parse_selection(&sel_str) {
+                    Ok(s) => s,
+                    Err(e) => { self.command_line.log(format!("Selection error: {}", e)); return; }
+                };
+                let mut total = 0usize;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate(&sel, mol);
+                    for (i, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask[i] {
+                            atom.vis_rep |= flag;
+                            total += 1;
+                        }
+                    }
+                }
+                self.scene.geometry_dirty = true;
+                self.command_line.log(format!("show {}: {} atoms", rep_name, total));
+            }
+            "hide" => {
+                let (rep_name, sel_str) = Self::parse_rep_selection(args);
+                let flag = match Self::rep_flag(&rep_name) {
+                    Some(f) => f,
+                    None => {
+                        self.command_line.log(format!("Unknown rep: '{}'. Use lines/sticks/spheres/cartoon", rep_name));
+                        return;
+                    }
+                };
+                let sel = match parse_selection(&sel_str) {
+                    Ok(s) => s,
+                    Err(e) => { self.command_line.log(format!("Selection error: {}", e)); return; }
+                };
+                let mut total = 0usize;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate(&sel, mol);
+                    for (i, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask[i] {
+                            atom.vis_rep &= !flag;
+                            total += 1;
+                        }
+                    }
+                }
+                self.scene.geometry_dirty = true;
+                self.command_line.log(format!("hide {}: {} atoms", rep_name, total));
+            }
+            "color" => {
+                // color <color_name>, <selection>
+                let (color_name, sel_str) = Self::parse_rep_selection(args);
+                let rgb = match Self::parse_color(&color_name) {
+                    Some(c) => c,
+                    None => {
+                        self.command_line.log(format!("Unknown color: '{}'. Try: red green blue yellow cyan magenta orange white gray pink salmon purple", color_name));
+                        return;
+                    }
+                };
+                let sel = match parse_selection(&sel_str) {
+                    Ok(s) => s,
+                    Err(e) => { self.command_line.log(format!("Selection error: {}", e)); return; }
+                };
+                let mut total = 0usize;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate(&sel, mol);
+                    for (i, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask[i] {
+                            atom.color = rgb;
+                            total += 1;
+                        }
+                    }
+                }
+                self.scene.geometry_dirty = true;
+                self.command_line.log(format!("color {}: {} atoms", color_name, total));
+            }
+            "select" => {
+                // select <selection> — just counts matching atoms
+                let sel = match parse_selection(args) {
+                    Ok(s) => s,
+                    Err(e) => { self.command_line.log(format!("Selection error: {}", e)); return; }
+                };
+                let mut total = 0usize;
+                for mol in &self.scene.molecules {
+                    let mask = evaluate(&sel, mol);
+                    total += count_selected(&mask);
+                }
+                self.command_line.log(format!("Selected {} atoms", total));
             }
             "reset" => {
                 if let Some(mol) = self.scene.molecules.first() {
@@ -152,12 +285,29 @@ impl MolApp {
                 }
                 self.command_line.log("View reset.");
             }
+            "bg_color" | "bg" => {
+                let color_name = args.trim().to_lowercase();
+                if let Some(rgb) = Self::parse_color(&color_name) {
+                    self.scene.bg_color = rgb;
+                    self.command_line.log(format!("Background set to {}", color_name));
+                } else {
+                    self.command_line.log(format!("Unknown color: '{}'", color_name));
+                }
+            }
             "help" => {
-                self.command_line.log("Commands: load <file>, reset, help");
+                self.command_line.log("Commands:");
+                self.command_line.log("  load <file>             — Load a PDB file");
+                self.command_line.log("  show <rep>[, <sel>]     — Show representation (lines/sticks/spheres/cartoon)");
+                self.command_line.log("  hide <rep>[, <sel>]     — Hide representation");
+                self.command_line.log("  color <color>[, <sel>]  — Color atoms");
+                self.command_line.log("  select <sel>            — Count matching atoms");
+                self.command_line.log("  bg_color <color>        — Set background color");
+                self.command_line.log("  reset                   — Reset camera view");
+                self.command_line.log("Selections: chain A, resi 1-50, name CA, resn ALA, elem C, hetatm, all, not/and/or, ()");
             }
             _ => {
                 self.command_line
-                    .log(format!("Unknown command: '{}'", parts[0]));
+                    .log(format!("Unknown command: '{}'. Type 'help' for usage.", verb));
             }
         }
     }
@@ -273,7 +423,7 @@ impl eframe::App for MolApp {
 
                     // Update camera uniforms
                     let aspect = offscreen.width as f32 / offscreen.height as f32;
-                    renderer.update_uniforms(queue, &self.scene.camera, aspect);
+                    renderer.update_uniforms(queue, &self.scene.camera, aspect, offscreen.width, offscreen.height);
 
                     // Render to offscreen texture
                     let mut encoder =
@@ -282,12 +432,8 @@ impl eframe::App for MolApp {
                         });
 
                     renderer.paint(
-                        device,
-                        queue,
                         &mut encoder,
                         &offscreen.view,
-                        offscreen.width,
-                        offscreen.height,
                     );
 
                     queue.submit(std::iter::once(encoder.finish()));

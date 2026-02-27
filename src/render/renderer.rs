@@ -5,16 +5,20 @@ use wgpu::util::DeviceExt;
 use crate::core::atom::REP_LINES;
 use crate::core::molecule::Molecule;
 use crate::render::camera::Camera;
+use crate::render::rep_spheres::SphereRep;
+use crate::render::rep_sticks::StickRep;
 
-// ── GPU types ───────────────────────────────────────────────────────────
+// ── Unified GPU uniform struct (matches all three shaders) ──────────────
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Uniforms {
     pub view_proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
     pub eye_pos: [f32; 4],
     pub light_dir: [f32; 4],
-    pub ambient: [f32; 4],
+    pub viewport_size: [f32; 4],
 }
 
 #[repr(C)]
@@ -24,35 +28,41 @@ pub struct LineVertex {
     pub color: [f32; 3],
 }
 
-// ── Renderer resource that lives in egui_wgpu callback resources ────────
+// ── Main renderer ───────────────────────────────────────────────────────
 
 pub struct MolRenderer {
-    pipeline: wgpu::RenderPipeline,
+    // Shared
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
-    vertex_buffer: Option<wgpu::Buffer>,
-    num_vertices: u32,
     depth_texture: Option<wgpu::TextureView>,
     depth_size: (u32, u32),
+
+    // Lines
+    line_pipeline: wgpu::RenderPipeline,
+    line_vertex_buffer: Option<wgpu::Buffer>,
+    line_vertex_count: u32,
+
+    // Spheres
+    sphere_pipeline: wgpu::RenderPipeline,
+    sphere_rep: SphereRep,
+
+    // Sticks
+    stick_pipeline: wgpu::RenderPipeline,
+    stick_rep: StickRep,
 }
 
 impl MolRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        // Load shader
-        let shader_src = include_str!("shaders/line.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("line_shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
-
-        // Uniform buffer + bind group layout
+        // ── Shared uniform buffer + bind group ──────────────────────────
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniform_buffer"),
             contents: bytemuck::cast_slice(&[Uniforms {
                 view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+                view: Mat4::IDENTITY.to_cols_array_2d(),
+                proj: Mat4::IDENTITY.to_cols_array_2d(),
                 eye_pos: [0.0; 4],
-                light_dir: [0.0, -1.0, -1.0, 0.0],
-                ambient: [0.3, 0.3, 0.3, 1.0],
+                light_dir: [0.3, -0.8, -0.5, 0.0],
+                viewport_size: [1280.0, 800.0, 0.0, 0.0],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -81,39 +91,43 @@ impl MolRenderer {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("line_pipeline_layout"),
+            label: Some("shared_pipeline_layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        let vertex_buffers = [wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: 12,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-            ],
-        }];
+        let depth_stencil = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        // ── Line pipeline ───────────────────────────────────────────────
+        let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("line_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/line.wgsl").into()),
+        });
+
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("line_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &line_shader,
                 entry_point: Some("vs_main"),
-                buffers: &vertex_buffers,
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<LineVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
+                    ],
+                }],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &line_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
@@ -124,89 +138,159 @@ impl MolRenderer {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::LineList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
+                ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ── Sphere pipeline ─────────────────────────────────────────────
+        let sphere_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sphere_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sphere.wgsl").into()),
+        });
+
+        use crate::render::rep_spheres::SphereInstance;
+        let sphere_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sphere_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sphere_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SphereInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 }, // center
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32 },   // radius
+                        wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // color
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sphere_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
             }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ── Stick pipeline ──────────────────────────────────────────────
+        let stick_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cylinder_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cylinder.wgsl").into()),
+        });
+
+        use crate::render::rep_sticks::CylinderVertex;
+        let stick_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("stick_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &stick_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<CylinderVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },  // position
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // normal
+                        wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // color
+                    ],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &stick_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_stencil),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
         });
 
         Self {
-            pipeline,
             uniform_buffer,
             uniform_bind_group,
-            vertex_buffer: None,
-            num_vertices: 0,
             depth_texture: None,
             depth_size: (0, 0),
+            line_pipeline,
+            line_vertex_buffer: None,
+            line_vertex_count: 0,
+            sphere_pipeline,
+            sphere_rep: SphereRep::new(),
+            stick_pipeline,
+            stick_rep: StickRep::new(),
         }
     }
 
-    /// Rebuild the line vertex buffer from the current scene molecules.
+    /// Rebuild all representation geometry buffers.
     pub fn update_geometry(&mut self, device: &wgpu::Device, molecules: &[Molecule]) {
-        let mut vertices: Vec<LineVertex> = Vec::new();
-
+        // Lines
+        let mut line_verts: Vec<LineVertex> = Vec::new();
         for mol in molecules {
-            if !mol.visible {
-                continue;
-            }
+            if !mol.visible { continue; }
             for bond in &mol.bonds {
                 let a = &mol.atoms[bond.atom_a];
                 let b = &mol.atoms[bond.atom_b];
-
-                // Only draw if both atoms have lines rep enabled
-                if (a.vis_rep & REP_LINES) == 0 || (b.vis_rep & REP_LINES) == 0 {
-                    continue;
-                }
-
+                if (a.vis_rep & REP_LINES) == 0 || (b.vis_rep & REP_LINES) == 0 { continue; }
                 let pa = mol.coords[bond.atom_a];
                 let pb = mol.coords[bond.atom_b];
-
-                // Midpoint for two-color bond
-                let mid = [
-                    (pa[0] + pb[0]) * 0.5,
-                    (pa[1] + pb[1]) * 0.5,
-                    (pa[2] + pb[2]) * 0.5,
-                ];
-
-                // First half: atom A color
-                vertices.push(LineVertex { position: pa, color: a.color });
-                vertices.push(LineVertex { position: mid, color: a.color });
-
-                // Second half: atom B color
-                vertices.push(LineVertex { position: mid, color: b.color });
-                vertices.push(LineVertex { position: pb, color: b.color });
+                let mid = [(pa[0]+pb[0])*0.5, (pa[1]+pb[1])*0.5, (pa[2]+pb[2])*0.5];
+                line_verts.push(LineVertex { position: pa, color: a.color });
+                line_verts.push(LineVertex { position: mid, color: a.color });
+                line_verts.push(LineVertex { position: mid, color: b.color });
+                line_verts.push(LineVertex { position: pb, color: b.color });
             }
         }
+        self.line_vertex_count = line_verts.len() as u32;
+        self.line_vertex_buffer = if line_verts.is_empty() {
+            None
+        } else {
+            Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("line_vertices"),
+                contents: bytemuck::cast_slice(&line_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            }))
+        };
 
-        self.num_vertices = vertices.len() as u32;
+        // Spheres
+        self.sphere_rep.update(device, molecules);
 
-        if vertices.is_empty() {
-            self.vertex_buffer = None;
-            return;
-        }
-
-        self.vertex_buffer = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("line_vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        }));
+        // Sticks
+        self.stick_rep.update(device, molecules);
     }
 
     /// Update the uniform buffer with current camera matrices.
-    pub fn update_uniforms(&self, queue: &wgpu::Queue, camera: &Camera, aspect: f32) {
+    pub fn update_uniforms(&self, queue: &wgpu::Queue, camera: &Camera, aspect: f32, width: u32, height: u32) {
         let view = camera.view_matrix();
         let proj = camera.projection_matrix(aspect);
         let view_proj = proj * view;
@@ -214,9 +298,11 @@ impl MolRenderer {
 
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
+            view: view.to_cols_array_2d(),
+            proj: proj.to_cols_array_2d(),
             eye_pos: [eye.x, eye.y, eye.z, 1.0],
             light_dir: [0.3, -0.8, -0.5, 0.0],
-            ambient: [0.3, 0.3, 0.3, 1.0],
+            viewport_size: [width as f32, height as f32, 0.0, 0.0],
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -243,22 +329,37 @@ impl MolRenderer {
         self.depth_size = (w, h);
     }
 
-    /// Render the molecule geometry. Called from the egui paint callback.
+    /// Render all representations.
     pub fn paint(
         &self,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         color_view: &wgpu::TextureView,
-        _width: u32,
-        _height: u32,
     ) {
         let depth_view = match &self.depth_texture {
             Some(v) => v,
             None => return,
         };
 
-        if self.num_vertices == 0 {
+        let has_anything = self.line_vertex_count > 0
+            || self.sphere_rep.instance_count > 0
+            || self.stick_rep.index_count > 0;
+
+        if !has_anything {
+            // Still clear the framebuffer
+            let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
             return;
         }
 
@@ -268,12 +369,7 @@ impl MolRenderer {
                 view: color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -289,11 +385,35 @@ impl MolRenderer {
             occlusion_query_set: None,
         });
 
-        rpass.set_pipeline(&self.pipeline);
-        rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        if let Some(vb) = &self.vertex_buffer {
-            rpass.set_vertex_buffer(0, vb.slice(..));
-            rpass.draw(0..self.num_vertices, 0..1);
+        // Draw lines
+        if self.line_vertex_count > 0 {
+            if let Some(vb) = &self.line_vertex_buffer {
+                rpass.set_pipeline(&self.line_pipeline);
+                rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.draw(0..self.line_vertex_count, 0..1);
+            }
+        }
+
+        // Draw sticks
+        if self.stick_rep.index_count > 0 {
+            if let (Some(vb), Some(ib)) = (&self.stick_rep.vertex_buffer, &self.stick_rep.index_buffer) {
+                rpass.set_pipeline(&self.stick_pipeline);
+                rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.stick_rep.index_count, 0, 0..1);
+            }
+        }
+
+        // Draw spheres (instanced, 6 verts per instance = 1 billboard quad)
+        if self.sphere_rep.instance_count > 0 {
+            if let Some(ib) = &self.sphere_rep.instance_buffer {
+                rpass.set_pipeline(&self.sphere_pipeline);
+                rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                rpass.set_vertex_buffer(0, ib.slice(..));
+                rpass.draw(0..6, 0..self.sphere_rep.instance_count);
+            }
         }
     }
 }

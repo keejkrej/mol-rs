@@ -3,6 +3,7 @@ mod core;
 mod io;
 mod render;
 mod scene;
+mod selection;
 mod ui;
 
 use app::MolApp;
