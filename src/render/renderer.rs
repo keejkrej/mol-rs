@@ -5,6 +5,7 @@ use wgpu::util::DeviceExt;
 use crate::core::atom::REP_LINES;
 use crate::core::molecule::Molecule;
 use crate::render::camera::Camera;
+use crate::render::rep_cartoon::CartoonRep;
 use crate::render::rep_spheres::SphereRep;
 use crate::render::rep_sticks::StickRep;
 
@@ -49,6 +50,10 @@ pub struct MolRenderer {
     // Sticks
     stick_pipeline: wgpu::RenderPipeline,
     stick_rep: StickRep,
+
+    // Cartoon
+    cartoon_pipeline: wgpu::RenderPipeline,
+    cartoon_rep: CartoonRep,
 }
 
 impl MolRenderer {
@@ -199,21 +204,23 @@ impl MolRenderer {
         });
 
         use crate::render::rep_sticks::CylinderVertex;
+        let mesh_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<CylinderVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },  // position
+                wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // normal
+                wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // color
+            ],
+        };
+
         let stick_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("stick_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &stick_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<CylinderVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },  // position
-                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 }, // normal
-                        wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x3 }, // color
-                    ],
-                }],
+                buffers: &[mesh_vertex_layout.clone()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -229,6 +236,42 @@ impl MolRenderer {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // ── Cartoon pipeline ─────────────────────────────────────────────
+        let cartoon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cartoon_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cartoon.wgsl").into()),
+        });
+
+        let cartoon_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cartoon_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &cartoon_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[mesh_vertex_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &cartoon_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None, // Ribbons are visible from both sides
                 ..Default::default()
             },
             depth_stencil: Some(depth_stencil),
@@ -249,6 +292,8 @@ impl MolRenderer {
             sphere_rep: SphereRep::new(),
             stick_pipeline,
             stick_rep: StickRep::new(),
+            cartoon_pipeline,
+            cartoon_rep: CartoonRep::new(),
         }
     }
 
@@ -287,6 +332,9 @@ impl MolRenderer {
 
         // Sticks
         self.stick_rep.update(device, molecules);
+
+        // Cartoon
+        self.cartoon_rep.update(device, molecules);
     }
 
     /// Update the uniform buffer with current camera matrices.
@@ -342,7 +390,8 @@ impl MolRenderer {
 
         let has_anything = self.line_vertex_count > 0
             || self.sphere_rep.instance_count > 0
-            || self.stick_rep.index_count > 0;
+            || self.stick_rep.index_count > 0
+            || self.cartoon_rep.index_count > 0;
 
         if !has_anything {
             // Still clear the framebuffer
@@ -413,6 +462,17 @@ impl MolRenderer {
                 rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 rpass.set_vertex_buffer(0, ib.slice(..));
                 rpass.draw(0..6, 0..self.sphere_rep.instance_count);
+            }
+        }
+
+        // Draw cartoon
+        if self.cartoon_rep.index_count > 0 {
+            if let (Some(vb), Some(ib)) = (&self.cartoon_rep.vertex_buffer, &self.cartoon_rep.index_buffer) {
+                rpass.set_pipeline(&self.cartoon_pipeline);
+                rpass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..self.cartoon_rep.index_count, 0, 0..1);
             }
         }
     }

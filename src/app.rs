@@ -9,12 +9,13 @@ use crate::render::renderer::MolRenderer;
 use crate::scene::scene::Scene;
 use crate::selection::{parse_selection, evaluate, evaluator::count_selected};
 use crate::ui::command_line::CommandLine;
-use crate::ui::control_panel;
+use crate::ui::control_panel::{self, ControlPanelState};
 use crate::ui::object_panel;
 
 pub struct MolApp {
     pub scene: Scene,
     pub command_line: CommandLine,
+    pub control_panel_state: ControlPanelState,
     /// wgpu render state obtained from creation context.
     render_state: Option<egui_wgpu::RenderState>,
     /// The renderer is created lazily on first frame (needs wgpu device).
@@ -42,6 +43,7 @@ impl MolApp {
         Self {
             scene: Scene::default(),
             command_line: CommandLine::default(),
+            control_panel_state: ControlPanelState::default(),
             render_state,
             renderer: None,
             offscreen: None,
@@ -366,7 +368,7 @@ impl eframe::App for MolApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     object_panel::object_panel(ui, &mut self.scene);
                     ui.add_space(16.0);
-                    control_panel::control_panel(ui, &mut self.scene);
+                    control_panel::control_panel(ui, &mut self.scene, &mut self.control_panel_state);
                 });
             });
 
