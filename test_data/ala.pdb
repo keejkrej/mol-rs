@@ -1,0 +1,12 @@
+HEADER    TEST MOLECULE - ALANINE DIPEPTIDE
+ATOM      1  N   ALA A   1       1.458   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       2.009   1.420   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       1.555   2.130   1.250  1.00  0.00           C
+ATOM      4  O   ALA A   1       0.880   1.540   2.090  1.00  0.00           O
+ATOM      5  CB  ALA A   1       1.502   2.130  -1.230  1.00  0.00           C
+ATOM      6  N   ALA A   2       1.950   3.370   1.320  1.00  0.00           N
+ATOM      7  CA  ALA A   2       1.555   4.130   2.530  1.00  0.00           C
+ATOM      8  C   ALA A   2       2.520   5.280   2.690  1.00  0.00           C
+ATOM      9  O   ALA A   2       3.280   5.560   1.780  1.00  0.00           O
+ATOM     10  CB  ALA A   2       1.680   3.210   3.730  1.00  0.00           C
+END

@@ -1,0 +1,32 @@
+[package]
+name = "mol-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A PyMOL-like molecular visualization tool in Rust"
+
+[dependencies]
+# GUI framework
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+
+# Math
+glam = { version = "0.29", features = ["bytemuck"] }
+
+# GPU buffer casting
+bytemuck = { version = "1", features = ["derive"] }
+
+# File dialog
+rfd = "0.15"
+
+# Image export
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# GPU rendering
+wgpu = "24"
+
+# PDB/CIF parsing helpers
+nom = "7"
