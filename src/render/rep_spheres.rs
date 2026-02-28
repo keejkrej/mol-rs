@@ -29,24 +29,38 @@ impl SphereRep {
     }
 
     /// Rebuild the instance buffer from molecules.
-    pub fn update(&mut self, device: &wgpu::Device, molecules: &[Molecule]) {
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        molecules: &[Molecule],
+        current_state: usize,
+        all_states: bool,
+    ) {
         let mut instances: Vec<SphereInstance> = Vec::new();
 
         for mol in molecules {
             if !mol.visible {
                 continue;
             }
-            for (i, atom) in mol.atoms.iter().enumerate() {
-                if (atom.vis_rep & REP_SPHERES) == 0 {
-                    continue;
+            let (start, end) = if all_states {
+                (1, mol.state_count())
+            } else {
+                (current_state, current_state)
+            };
+            for state in start..=end {
+                let coords = mol.coords_for_state(state);
+                for (i, atom) in mol.atoms.iter().enumerate() {
+                    if (atom.vis_rep & REP_SPHERES) == 0 {
+                        continue;
+                    }
+                    let pos = coords[i];
+                    instances.push(SphereInstance {
+                        center: pos,
+                        radius: atom.vdw * 0.25, // Scale down for ball-and-stick style
+                        color: atom.color,
+                        _pad: 0.0,
+                    });
                 }
-                let pos = mol.coords[i];
-                instances.push(SphereInstance {
-                    center: pos,
-                    radius: atom.vdw * 0.25, // Scale down for ball-and-stick style
-                    color: atom.color,
-                    _pad: 0.0,
-                });
             }
         }
 

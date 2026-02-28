@@ -1972,7 +1972,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mol-rs"
+name = "mol"
 version = "0.1.0"
 dependencies = [
  "bytemuck",

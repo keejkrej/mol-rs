@@ -9,7 +9,7 @@ pub fn object_panel(ui: &mut Ui, scene: &mut Scene) {
     ui.separator();
 
     if scene.molecules.is_empty() {
-        ui.label("No molecules loaded.\nUse File > Open to load a PDB.");
+        ui.label("No molecules loaded.\nUse File > Open to load a PDB/CIF.");
         return;
     }
 
@@ -20,7 +20,7 @@ pub fn object_panel(ui: &mut Ui, scene: &mut Scene) {
             if ui.checkbox(&mut mol.visible, "").changed() {
                 dirty = true;
             }
-            ui.label(&mol.name);
+            ui.label(format!("{} ({} states)", mol.name, mol.state_count()));
         });
 
         ui.horizontal(|ui| {

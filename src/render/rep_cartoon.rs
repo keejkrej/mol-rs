@@ -56,7 +56,13 @@ impl CartoonRep {
     }
 
     /// Rebuild geometry from molecules.
-    pub fn update(&mut self, device: &wgpu::Device, molecules: &[Molecule]) {
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        molecules: &[Molecule],
+        current_state: usize,
+        all_states: bool,
+    ) {
         let mut vertices: Vec<CartoonVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
 
@@ -64,17 +70,25 @@ impl CartoonRep {
             if !mol.visible {
                 continue;
             }
-            // Extract backbone traces per chain
-            let chains = extract_backbone_chains(mol);
-            for chain in &chains {
-                if chain.len() < 2 {
-                    continue;
+            let (start, end) = if all_states {
+                (1, mol.state_count())
+            } else {
+                (current_state, current_state)
+            };
+            for state in start..=end {
+                let coords = mol.coords_for_state(state);
+                // Extract backbone traces per chain
+                let chains = extract_backbone_chains(mol, coords);
+                for chain in &chains {
+                    if chain.len() < 2 {
+                        continue;
+                    }
+                    let spline = build_spline(chain);
+                    if spline.len() < 2 {
+                        continue;
+                    }
+                    generate_cartoon_mesh(&spline, &mut vertices, &mut indices);
                 }
-                let spline = build_spline(chain);
-                if spline.len() < 2 {
-                    continue;
-                }
-                generate_cartoon_mesh(&spline, &mut vertices, &mut indices);
             }
         }
 
@@ -109,7 +123,7 @@ struct ControlPoint {
 
 /// Extract per-chain backbone CA traces from a molecule.
 /// Only includes atoms with REP_CARTOON enabled.
-fn extract_backbone_chains(mol: &Molecule) -> Vec<Vec<ControlPoint>> {
+fn extract_backbone_chains(mol: &Molecule, coords: &[[f32; 3]]) -> Vec<Vec<ControlPoint>> {
     let mut chains: Vec<Vec<ControlPoint>> = Vec::new();
     let mut current_chain: Vec<ControlPoint> = Vec::new();
     let mut last_chain_id: Option<char> = None;
@@ -139,7 +153,7 @@ fn extract_backbone_chains(mol: &Molecule) -> Vec<Vec<ControlPoint>> {
         last_chain_id = Some(atom.chain);
 
         current_chain.push(ControlPoint {
-            pos: Vec3::from(mol.coords[ca_idx]),
+            pos: Vec3::from(coords[ca_idx]),
             ss: res.ss_type,
             color: atom.color,
         });

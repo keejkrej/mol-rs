@@ -1,5 +1,5 @@
 [package]
-name = "mol-rs"
+name = "mol"
 version = "0.1.0"
 edition = "2021"
 description = "A PyMOL-like molecular visualization tool in Rust"

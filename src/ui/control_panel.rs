@@ -84,11 +84,48 @@ pub fn control_panel(ui: &mut Ui, scene: &mut Scene, state: &mut ControlPanelSta
 
     ui.add_space(8.0);
 
+    // State controls
+    let max_states = scene.max_state_count();
+    ui.label("State:");
+    let mut slider_state = scene.current_state as i32;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+            max_states > 1,
+            egui::Slider::new(&mut slider_state, 1..=max_states as i32).show_value(false),
+            )
+            .changed()
+        {
+            scene.set_state_clamped(slider_state as usize);
+        }
+
+        let mut state_num = scene.current_state as i32;
+        if ui
+            .add(
+                egui::DragValue::new(&mut state_num)
+                    .speed(1.0)
+                    .range(1..=max_states as i32),
+            )
+            .changed()
+        {
+            scene.set_state_clamped(state_num as usize);
+        }
+        ui.label(format!("/{}", max_states));
+    });
+
+    let mut all_states = scene.all_states;
+    if ui.checkbox(&mut all_states, "All states").changed() {
+        scene.all_states = all_states;
+        scene.geometry_dirty = true;
+    }
+
+    ui.add_space(8.0);
+
     // Reset view
     if ui.button("Reset View").clicked() {
         if let Some(mol) = scene.molecules.first() {
-            let c = mol.centroid();
-            let r = mol.radius();
+            let c = mol.centroid_for_state(scene.current_state);
+            let r = mol.radius_for_state(scene.current_state);
             scene.camera.reset_to_fit(c, r);
         }
     }
@@ -100,5 +137,6 @@ pub fn control_panel(ui: &mut Ui, scene: &mut Scene, state: &mut ControlPanelSta
         ui.label(format!("Atoms: {}", mol.atoms.len()));
         ui.label(format!("Bonds: {}", mol.bonds.len()));
         ui.label(format!("Residues: {}", mol.residues.len()));
+        ui.label(format!("States: {}", scene.max_state_count()));
     }
 }

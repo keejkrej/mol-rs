@@ -207,9 +207,10 @@ impl MolApp {
                 let mut n2 = 0.0f32;
 
                 for mol in &self.scene.molecules {
+                    let coords = mol.coords_for_state(self.scene.current_state);
                     let mask1 = evaluate(&sel1, mol);
                     let mask2 = evaluate(&sel2, mol);
-                    for (i, p) in mol.coords.iter().enumerate() {
+                    for (i, p) in coords.iter().enumerate() {
                         if mask1[i] {
                             c1[0] += p[0];
                             c1[1] += p[1];
@@ -254,12 +255,75 @@ impl MolApp {
             }
             "reset" => {
                 if let Some(mol) = self.scene.molecules.first() {
-                    let c = mol.centroid();
-                    let r = mol.radius();
+                    let c = mol.centroid_for_state(self.scene.current_state);
+                    let r = mol.radius_for_state(self.scene.current_state);
                     self.scene.camera.reset_to_fit(c, r);
                 }
                 self.scene.measurements.clear();
                 self.command_line.log("View reset.");
+            }
+            "state" | "frame" => {
+                if args.is_empty() {
+                    self.command_line
+                        .log(format!("State: {}/{}", self.scene.current_state, self.scene.max_state_count()));
+                    return;
+                }
+                match args.parse::<usize>() {
+                    Ok(n) => {
+                        self.scene.set_state_clamped(n);
+                        self.command_line.log(format!(
+                            "State: {}/{}",
+                            self.scene.current_state,
+                            self.scene.max_state_count()
+                        ));
+                    }
+                    Err(_) => {
+                        self.command_line.log("Usage: state <n>");
+                    }
+                }
+            }
+            "next" => {
+                self.scene.next_state();
+                self.command_line.log(format!(
+                    "State: {}/{}",
+                    self.scene.current_state,
+                    self.scene.max_state_count()
+                ));
+            }
+            "prev" => {
+                self.scene.prev_state();
+                self.command_line.log(format!(
+                    "State: {}/{}",
+                    self.scene.current_state,
+                    self.scene.max_state_count()
+                ));
+            }
+            "all_states" => {
+                if args.is_empty() {
+                    self.command_line.log(format!(
+                        "all_states is {}",
+                        if self.scene.all_states { "on" } else { "off" }
+                    ));
+                    return;
+                }
+                let v = args.to_lowercase();
+                let parsed = match v.as_str() {
+                    "on" | "1" | "true" => Some(true),
+                    "off" | "0" | "false" => Some(false),
+                    _ => None,
+                };
+                if let Some(on) = parsed {
+                    if self.scene.all_states != on {
+                        self.scene.all_states = on;
+                        self.scene.geometry_dirty = true;
+                    }
+                    self.command_line.log(format!(
+                        "all_states {}",
+                        if self.scene.all_states { "on" } else { "off" }
+                    ));
+                } else {
+                    self.command_line.log("Usage: all_states <on|off>");
+                }
             }
             "bg_color" | "bg" => {
                 let color_name = args.trim().to_lowercase();
@@ -275,7 +339,7 @@ impl MolApp {
             "help" => {
                 self.command_line.log("Commands:");
                 self.command_line
-                    .log("  load <file>             — Load a PDB file");
+                    .log("  load <file>             — Load a PDB/CIF file");
                 self.command_line.log(
                     "  show <rep>[, <sel>]     — Show representation (lines/sticks/spheres/cartoon)",
                 );
@@ -287,6 +351,12 @@ impl MolApp {
                     .log("  select <sel>            — Count matching atoms");
                 self.command_line
                     .log("  distance <s1>, <s2>     — Measure distance");
+                self.command_line
+                    .log("  state <n> / frame <n>   — Set current state");
+                self.command_line
+                    .log("  next / prev             — Step through states");
+                self.command_line
+                    .log("  all_states <on|off>     — Render all states or current state");
                 self.command_line
                     .log("  png <file>              — Save screenshot");
                 self.command_line

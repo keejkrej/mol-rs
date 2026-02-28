@@ -64,44 +64,58 @@ impl StickRep {
     }
 
     /// Rebuild instances from molecules.
-    pub fn update(&mut self, device: &wgpu::Device, molecules: &[Molecule]) {
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        molecules: &[Molecule],
+        current_state: usize,
+        all_states: bool,
+    ) {
         let mut instances: Vec<StickInstance> = Vec::new();
 
         for mol in molecules {
             if !mol.visible {
                 continue;
             }
-            for bond in &mol.bonds {
-                let a = &mol.atoms[bond.atom_a];
-                let b = &mol.atoms[bond.atom_b];
+            let (start, end) = if all_states {
+                (1, mol.state_count())
+            } else {
+                (current_state, current_state)
+            };
+            for state in start..=end {
+                let coords = mol.coords_for_state(state);
+                for bond in &mol.bonds {
+                    let a = &mol.atoms[bond.atom_a];
+                    let b = &mol.atoms[bond.atom_b];
 
-                if (a.vis_rep & REP_STICKS) == 0 || (b.vis_rep & REP_STICKS) == 0 {
-                    continue;
+                    if (a.vis_rep & REP_STICKS) == 0 || (b.vis_rep & REP_STICKS) == 0 {
+                        continue;
+                    }
+
+                    let pa = Vec3::from(coords[bond.atom_a]);
+                    let pb = Vec3::from(coords[bond.atom_b]);
+                    let mid = (pa + pb) * 0.5;
+
+                    // First half: atom A color
+                    instances.push(StickInstance {
+                        start: pa.to_array(),
+                        _pad1: 0.0,
+                        end: mid.to_array(),
+                        _pad2: 0.0,
+                        color: a.color,
+                        radius: STICK_RADIUS,
+                    });
+
+                    // Second half: atom B color
+                    instances.push(StickInstance {
+                        start: mid.to_array(),
+                        _pad1: 0.0,
+                        end: pb.to_array(),
+                        _pad2: 0.0,
+                        color: b.color,
+                        radius: STICK_RADIUS,
+                    });
                 }
-
-                let pa = Vec3::from(mol.coords[bond.atom_a]);
-                let pb = Vec3::from(mol.coords[bond.atom_b]);
-                let mid = (pa + pb) * 0.5;
-
-                // First half: atom A color
-                instances.push(StickInstance {
-                    start: pa.to_array(),
-                    _pad1: 0.0,
-                    end: mid.to_array(),
-                    _pad2: 0.0,
-                    color: a.color,
-                    radius: STICK_RADIUS,
-                });
-
-                // Second half: atom B color
-                instances.push(StickInstance {
-                    start: mid.to_array(),
-                    _pad1: 0.0,
-                    end: pb.to_array(),
-                    _pad2: 0.0,
-                    color: b.color,
-                    radius: STICK_RADIUS,
-                });
             }
         }
 

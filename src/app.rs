@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use eframe::egui_wgpu;
 
 use crate::io::{cif, pdb};
+use crate::io::LoadResult;
 use crate::render::renderer::MolRenderer;
 use crate::scene::scene::Scene;
 use crate::ui::command_line::CommandLine;
@@ -129,13 +130,24 @@ impl MolApp {
         };
 
         match res {
-            Ok(mol) => {
-                let name = mol.name.clone();
-                let atoms = mol.atoms.len();
-                let bonds = mol.bonds.len();
-                self.scene.add_molecule(mol);
+            Ok(LoadResult {
+                molecule,
+                warnings,
+                source_model_count,
+            }) => {
+                let name = molecule.name.clone();
+                let atoms = molecule.atoms.len();
+                let bonds = molecule.bonds.len();
+                let states = molecule.state_count();
+                self.scene.add_molecule(molecule);
                 self.command_line
-                    .log(format!("Loaded '{}': {} atoms, {} bonds", name, atoms, bonds));
+                    .log(format!(
+                        "Loaded '{}': {} atoms, {} bonds, {} state(s) from {} model(s)",
+                        name, atoms, bonds, states, source_model_count
+                    ));
+                for warning in warnings {
+                    self.command_line.log(format!("Warning: {}", warning));
+                }
             }
             Err(e) => {
                 self.command_line.log(format!("Error: {}", e));

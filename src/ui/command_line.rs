@@ -12,7 +12,7 @@ impl Default for CommandLine {
         Self {
             input: String::new(),
             history: Vec::new(),
-            output: vec!["mol-rs ready. Type 'help' for commands.".into()],
+            output: vec!["mol ready. Type 'help' for commands.".into()],
         }
     }
 }

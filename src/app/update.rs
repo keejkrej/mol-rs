@@ -17,7 +17,7 @@ impl eframe::App for MolApp {
         TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open PDB...").clicked() {
+                    if ui.button("Open File...").clicked() {
                         self.open_file_requested = true;
                         ui.close_menu();
                     }
@@ -32,7 +32,7 @@ impl eframe::App for MolApp {
         if self.open_file_requested {
             self.open_file_requested = false;
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("PDB/CIF files", &["pdb", "ent", "cif"])
+                .add_filter("PDB/CIF files", &["pdb", "ent", "cif", "mmcif"])
                 .add_filter("All files", &["*"])
                 .pick_file()
             {
@@ -116,7 +116,12 @@ impl eframe::App for MolApp {
                 if let (Some(renderer), Some(offscreen)) = (&mut self.renderer, &self.offscreen) {
                     // Rebuild geometry if dirty
                     if self.scene.geometry_dirty {
-                        renderer.update_geometry(device, &self.scene.molecules);
+                        renderer.update_geometry(
+                            device,
+                            &self.scene.molecules,
+                            self.scene.current_state,
+                            self.scene.all_states,
+                        );
                         self.scene.geometry_dirty = false;
                     }
 

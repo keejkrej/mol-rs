@@ -8,8 +8,9 @@ use super::secondary_structure::SSType;
 pub struct Molecule {
     pub name: String,
     pub atoms: Vec<AtomInfo>,
-    /// Coordinates as flat [x, y, z] per atom; coords[i] is the position of atoms[i].
-    pub coords: Vec<[f32; 3]>,
+    /// State-specific coordinates. coord_sets[0] is state 1.
+    /// Each state vector aligns with `atoms` by index.
+    pub coord_sets: Vec<Vec<[f32; 3]>>,
     pub bonds: Vec<BondInfo>,
     /// Precomputed residue groupings (filled after loading).
     pub residues: Vec<ResidueRange>,
@@ -22,32 +23,48 @@ impl Molecule {
         Self {
             name,
             atoms: Vec::new(),
-            coords: Vec::new(),
+            coord_sets: vec![Vec::new()],
             bonds: Vec::new(),
             residues: Vec::new(),
             visible: true,
         }
     }
 
-    /// Compute the centroid of all atom coordinates.
-    pub fn centroid(&self) -> [f32; 3] {
-        if self.coords.is_empty() {
+    pub fn state_count(&self) -> usize {
+        self.coord_sets.len()
+    }
+
+    pub fn coords_for_state(&self, state_1_based: usize) -> &[[f32; 3]] {
+        if self.coord_sets.is_empty() {
+            return &[];
+        }
+        let idx = state_1_based
+            .saturating_sub(1)
+            .min(self.coord_sets.len() - 1);
+        &self.coord_sets[idx]
+    }
+
+    /// Compute the centroid of atom coordinates in a specific state.
+    pub fn centroid_for_state(&self, state_1_based: usize) -> [f32; 3] {
+        let coords = self.coords_for_state(state_1_based);
+        if coords.is_empty() {
             return [0.0; 3];
         }
         let mut c = [0.0f32; 3];
-        for p in &self.coords {
+        for p in coords {
             c[0] += p[0];
             c[1] += p[1];
             c[2] += p[2];
         }
-        let n = self.coords.len() as f32;
+        let n = coords.len() as f32;
         [c[0] / n, c[1] / n, c[2] / n]
     }
 
-    /// Compute the maximum distance from the centroid to any atom.
-    pub fn radius(&self) -> f32 {
-        let c = self.centroid();
-        self.coords
+    /// Compute the maximum distance from centroid in a specific state.
+    pub fn radius_for_state(&self, state_1_based: usize) -> f32 {
+        let coords = self.coords_for_state(state_1_based);
+        let c = self.centroid_for_state(state_1_based);
+        coords
             .iter()
             .map(|p| {
                 let dx = p[0] - c[0];

@@ -319,22 +319,36 @@ impl MolRenderer {
     }
 
     /// Rebuild all representation geometry buffers.
-    pub fn update_geometry(&mut self, device: &wgpu::Device, molecules: &[Molecule]) {
+    pub fn update_geometry(
+        &mut self,
+        device: &wgpu::Device,
+        molecules: &[Molecule],
+        current_state: usize,
+        all_states: bool,
+    ) {
         // Lines
         let mut line_verts: Vec<LineVertex> = Vec::new();
         for mol in molecules {
             if !mol.visible { continue; }
-            for bond in &mol.bonds {
-                let a = &mol.atoms[bond.atom_a];
-                let b = &mol.atoms[bond.atom_b];
-                if (a.vis_rep & REP_LINES) == 0 || (b.vis_rep & REP_LINES) == 0 { continue; }
-                let pa = mol.coords[bond.atom_a];
-                let pb = mol.coords[bond.atom_b];
-                let mid = [(pa[0]+pb[0])*0.5, (pa[1]+pb[1])*0.5, (pa[2]+pb[2])*0.5];
-                line_verts.push(LineVertex { position: pa, color: a.color });
-                line_verts.push(LineVertex { position: mid, color: a.color });
-                line_verts.push(LineVertex { position: mid, color: b.color });
-                line_verts.push(LineVertex { position: pb, color: b.color });
+            let (start, end) = if all_states {
+                (1, mol.state_count())
+            } else {
+                (current_state, current_state)
+            };
+            for state in start..=end {
+                let coords = mol.coords_for_state(state);
+                for bond in &mol.bonds {
+                    let a = &mol.atoms[bond.atom_a];
+                    let b = &mol.atoms[bond.atom_b];
+                    if (a.vis_rep & REP_LINES) == 0 || (b.vis_rep & REP_LINES) == 0 { continue; }
+                    let pa = coords[bond.atom_a];
+                    let pb = coords[bond.atom_b];
+                    let mid = [(pa[0]+pb[0])*0.5, (pa[1]+pb[1])*0.5, (pa[2]+pb[2])*0.5];
+                    line_verts.push(LineVertex { position: pa, color: a.color });
+                    line_verts.push(LineVertex { position: mid, color: a.color });
+                    line_verts.push(LineVertex { position: mid, color: b.color });
+                    line_verts.push(LineVertex { position: pb, color: b.color });
+                }
             }
         }
         self.line_vertex_count = line_verts.len() as u32;
@@ -349,13 +363,16 @@ impl MolRenderer {
         };
 
         // Spheres
-        self.sphere_rep.update(device, molecules);
+        self.sphere_rep
+            .update(device, molecules, current_state, all_states);
 
         // Sticks
-        self.stick_rep.update(device, molecules);
+        self.stick_rep
+            .update(device, molecules, current_state, all_states);
 
         // Cartoon
-        self.cartoon_rep.update(device, molecules);
+        self.cartoon_rep
+            .update(device, molecules, current_state, all_states);
     }
 
     /// Update the uniform buffer with current camera matrices.
