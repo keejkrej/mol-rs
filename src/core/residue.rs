@@ -2,6 +2,7 @@ use super::secondary_structure::SSType;
 
 /// A contiguous range of atoms belonging to one residue.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ResidueRange {
     pub chain: char,
     pub resn: String,

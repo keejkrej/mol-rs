@@ -1,5 +1,6 @@
 /// Static element data: symbol, VDW radius, CPK color, atomic mass.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct ElementData {
     pub symbol: &'static str,
     pub name: &'static str,

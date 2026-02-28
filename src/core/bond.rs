@@ -1,4 +1,5 @@
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct BondInfo {
     /// Index of the first atom.
     pub atom_a: usize,

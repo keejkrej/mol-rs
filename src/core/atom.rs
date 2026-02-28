@@ -8,6 +8,7 @@ pub const REP_CARTOON: u32 = 1 << 3;
 
 /// Per-atom information, modeled after PyMOL's AtomInfoType.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct AtomInfo {
     /// Atom name, e.g. "CA", "N", "O" (PDB columns 13-16, trimmed).
     pub name: String,

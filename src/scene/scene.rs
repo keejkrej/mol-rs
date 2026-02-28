@@ -3,6 +3,7 @@ use crate::render::camera::Camera;
 use crate::scene::color::{ColorScheme, apply_color_scheme};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Measurement {
     pub p1: [f32; 3],
     pub p2: [f32; 3],
