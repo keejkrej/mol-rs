@@ -2,7 +2,7 @@ use egui::Ui;
 
 use crate::scene::color::ColorScheme;
 use crate::scene::scene::Scene;
-use crate::selection::{parse_selection, evaluate, evaluator::count_selected};
+use crate::selection::{evaluate_with_coords, evaluator::count_selected, parse_selection};
 
 /// Persistent state for the control panel.
 pub struct ControlPanelState {
@@ -62,7 +62,8 @@ pub fn control_panel(ui: &mut Ui, scene: &mut Scene, state: &mut ControlPanelSta
                 Ok(sel) => {
                     let mut total = 0;
                     for mol in &scene.molecules {
-                        let mask = evaluate(&sel, mol);
+                        let coords = mol.coords_for_state(scene.current_state);
+                        let mask = evaluate_with_coords(&sel, mol, coords);
                         total += count_selected(&mask);
                     }
                     state.selection_count = Some(total);
@@ -91,8 +92,8 @@ pub fn control_panel(ui: &mut Ui, scene: &mut Scene, state: &mut ControlPanelSta
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
-            max_states > 1,
-            egui::Slider::new(&mut slider_state, 1..=max_states as i32).show_value(false),
+                max_states > 1,
+                egui::Slider::new(&mut slider_state, 1..=max_states as i32).show_value(false),
             )
             .changed()
         {

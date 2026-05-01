@@ -5,6 +5,7 @@ pub const REP_LINES: u32 = 1 << 0;
 pub const REP_STICKS: u32 = 1 << 1;
 pub const REP_SPHERES: u32 = 1 << 2;
 pub const REP_CARTOON: u32 = 1 << 3;
+pub const REP_ALL: u32 = REP_LINES | REP_STICKS | REP_SPHERES | REP_CARTOON;
 
 /// Per-atom information, modeled after PyMOL's AtomInfoType.
 #[derive(Debug, Clone)]

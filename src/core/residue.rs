@@ -20,9 +20,30 @@ pub struct ResidueRange {
 pub fn is_protein(resn: &str) -> bool {
     matches!(
         resn.trim().to_uppercase().as_str(),
-        "ALA" | "ARG" | "ASN" | "ASP" | "CYS" | "GLN" | "GLU" | "GLY" | "HIS" | "ILE" |
-        "LEU" | "LYS" | "MET" | "PHE" | "PRO" | "SER" | "THR" | "TRP" | "TYR" | "VAL" |
-        "ASX" | "GLX" | "UNK" | "MSE"
+        "ALA"
+            | "ARG"
+            | "ASN"
+            | "ASP"
+            | "CYS"
+            | "GLN"
+            | "GLU"
+            | "GLY"
+            | "HIS"
+            | "ILE"
+            | "LEU"
+            | "LYS"
+            | "MET"
+            | "PHE"
+            | "PRO"
+            | "SER"
+            | "THR"
+            | "TRP"
+            | "TYR"
+            | "VAL"
+            | "ASX"
+            | "GLX"
+            | "UNK"
+            | "MSE"
     )
 }
 
@@ -30,5 +51,12 @@ pub fn is_nucleic(resn: &str) -> bool {
     matches!(
         resn.trim().to_uppercase().as_str(),
         "A" | "C" | "G" | "T" | "U" | "DA" | "DC" | "DG" | "DT" | "DU"
+    )
+}
+
+pub fn is_solvent(resn: &str) -> bool {
+    matches!(
+        resn.trim().to_uppercase().as_str(),
+        "HOH" | "WAT" | "DOD" | "H2O" | "SOL" | "TIP" | "TIP3" | "TIP3P"
     )
 }

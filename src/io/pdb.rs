@@ -8,6 +8,12 @@ use crate::core::molecule::Molecule;
 use crate::core::secondary_structure::SSType;
 use crate::io::LoadResult;
 
+pub struct PdbWriteSource<'a> {
+    pub molecule: &'a Molecule,
+    pub coords: &'a [[f32; 3]],
+    pub mask: Option<&'a [bool]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AtomIdentity {
     is_hetatm: bool,
@@ -32,6 +38,114 @@ pub fn load_pdb(path: &Path) -> Result<LoadResult, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
     parse_pdb_string(&content, path)
+}
+
+/// Write selected atoms from one or more molecules as a single-state PDB file.
+pub fn write_pdb(path: &Path, sources: &[PdbWriteSource<'_>]) -> Result<usize, String> {
+    let (content, atom_count) = format_pdb_sources(sources);
+    std::fs::write(path, content)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    Ok(atom_count)
+}
+
+pub fn format_pdb_sources(sources: &[PdbWriteSource<'_>]) -> (String, usize) {
+    let mut out = String::new();
+    let mut serial = 1u32;
+    let mut atom_count = 0usize;
+    let mut source_serial_maps = Vec::with_capacity(sources.len());
+
+    for source in sources {
+        let mut serial_map = vec![None; source.molecule.atoms.len()];
+
+        for (idx, atom) in source.molecule.atoms.iter().enumerate() {
+            if !source
+                .mask
+                .is_none_or(|mask| mask.get(idx).copied().unwrap_or(false))
+            {
+                continue;
+            }
+            let Some(coord) = source.coords.get(idx).copied() else {
+                continue;
+            };
+
+            out.push_str(&format_pdb_atom_line(serial, atom, coord));
+            out.push('\n');
+            serial_map[idx] = Some(serial.min(99999));
+            serial = serial.saturating_add(1);
+            atom_count += 1;
+        }
+
+        source_serial_maps.push(serial_map);
+    }
+
+    for (source, serial_map) in sources.iter().zip(source_serial_maps.iter()) {
+        for bond in &source.molecule.bonds {
+            if bond.order == 0 {
+                continue;
+            }
+            let Some(atom_a) = serial_map.get(bond.atom_a).and_then(|serial| *serial) else {
+                continue;
+            };
+            let Some(atom_b) = serial_map.get(bond.atom_b).and_then(|serial| *serial) else {
+                continue;
+            };
+
+            out.push_str(&format!("CONECT{atom_a:>5}{atom_b:>5}\n"));
+        }
+    }
+
+    out.push_str("END\n");
+    (out, atom_count)
+}
+
+fn format_pdb_atom_line(serial: u32, atom: &AtomInfo, coord: [f32; 3]) -> String {
+    let record = if atom.is_hetatm { "HETATM" } else { "ATOM  " };
+    let name = format_atom_name(&atom.name, &atom.elem_symbol);
+    let alt = pdb_char(atom.alt, ' ');
+    let resn = truncate_ascii(&atom.resn, 3);
+    let chain = pdb_char(atom.chain, ' ');
+    let ins = pdb_char(atom.ins_code, ' ');
+    let elem = truncate_ascii(&atom.elem_symbol, 2);
+    format!(
+        "{record}{serial:>5} {name}{alt}{resn:>3} {chain}{resi:>4}{ins}   \
+         {x:>8.3}{y:>8.3}{z:>8.3}{occ:>6.2}{b:>6.2}          {elem:>2}",
+        record = record,
+        serial = serial.min(99999),
+        name = name,
+        alt = alt,
+        resn = resn,
+        chain = chain,
+        resi = atom.resi.clamp(-999, 9999),
+        ins = ins,
+        x = coord[0],
+        y = coord[1],
+        z = coord[2],
+        occ = atom.occupancy,
+        b = atom.b_factor,
+        elem = elem,
+    )
+}
+
+fn format_atom_name(name: &str, elem: &str) -> String {
+    let name = truncate_ascii(name.trim(), 4);
+    let elem_len = elem.trim().len();
+    if name.len() < 4 && elem_len <= 1 {
+        format!(" {name:<3}")
+    } else {
+        format!("{name:<4}")
+    }
+}
+
+fn truncate_ascii(s: &str, max_len: usize) -> String {
+    s.chars().take(max_len).collect()
+}
+
+fn pdb_char(ch: char, default: char) -> char {
+    if ch == '\0' {
+        default
+    } else {
+        ch
+    }
 }
 
 /// Parse PDB content from a string.
@@ -254,7 +368,12 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
 
     let elem_data = element_by_symbol(&elem_sym);
     let atomic_number = elem_data
-        .map(|e| ELEMENTS.iter().position(|x| std::ptr::eq(x, e)).unwrap_or(0) as u8)
+        .map(|e| {
+            ELEMENTS
+                .iter()
+                .position(|x| std::ptr::eq(x, e))
+                .unwrap_or(0) as u8
+        })
         .unwrap_or(0);
     let vdw = elem_data.map(|e| e.vdw).unwrap_or(1.7);
     let color = elem_data.map(|e| e.color).unwrap_or([0.5, 0.5, 0.5]);
@@ -296,20 +415,12 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
 }
 
 /// Parse CONECT record and add bonds (dedup later).
-fn parse_conect_line(
-    line: &str,
-    serial_map: &HashMap<u32, usize>,
-    bonds: &mut Vec<BondInfo>,
-) {
+fn parse_conect_line(line: &str, serial_map: &HashMap<u32, usize>, bonds: &mut Vec<BondInfo>) {
     // CONECT columns: 7-11 = origin, then 12-16, 17-21, 22-26, 27-31 = bonded atoms
     let bytes = line.as_bytes();
     let get = |s: usize, e: usize| -> Option<u32> {
         if e <= bytes.len() {
-            std::str::from_utf8(&bytes[s..e])
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
+            std::str::from_utf8(&bytes[s..e]).ok()?.trim().parse().ok()
         } else {
             None
         }
@@ -498,7 +609,11 @@ pub fn infer_bonds(mol: &mut Molecule) {
 mod tests {
     use std::path::Path;
 
-    use super::parse_pdb_string;
+    use crate::core::atom::AtomInfo;
+    use crate::core::bond::BondInfo;
+    use crate::core::molecule::Molecule;
+
+    use super::{format_pdb_sources, parse_pdb_string, PdbWriteSource};
 
     fn atom_line(
         rec: &str,
@@ -565,5 +680,68 @@ mod tests {
         assert_eq!(result.source_model_count, 2);
         assert_eq!(result.molecule.state_count(), 1);
         assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn format_pdb_sources_respects_selection_mask() {
+        let mut mol = Molecule::new("save".to_string());
+        mol.atoms.push(AtomInfo {
+            name: "CA".to_string(),
+            elem_symbol: "C".to_string(),
+            resn: "ALA".to_string(),
+            resi: 1,
+            chain: 'A',
+            serial: 10,
+            occupancy: 0.5,
+            b_factor: 12.5,
+            ..AtomInfo::default()
+        });
+        mol.atoms.push(AtomInfo {
+            name: "O".to_string(),
+            elem_symbol: "O".to_string(),
+            resn: "HOH".to_string(),
+            resi: 2,
+            chain: 'B',
+            is_hetatm: true,
+            serial: 11,
+            ..AtomInfo::default()
+        });
+        mol.atoms.push(AtomInfo {
+            name: "CB".to_string(),
+            elem_symbol: "C".to_string(),
+            resn: "ALA".to_string(),
+            resi: 1,
+            chain: 'A',
+            serial: 12,
+            ..AtomInfo::default()
+        });
+        mol.coord_sets = vec![vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]];
+        mol.bonds.push(BondInfo {
+            atom_a: 0,
+            atom_b: 2,
+            order: 1,
+        });
+        mol.bonds.push(BondInfo {
+            atom_a: 1,
+            atom_b: 2,
+            order: 1,
+        });
+
+        let mask = vec![true, false, true];
+        let (pdb, atom_count) = format_pdb_sources(&[PdbWriteSource {
+            molecule: &mol,
+            coords: mol.coords_for_state(1),
+            mask: Some(&mask),
+        }]);
+
+        assert_eq!(atom_count, 2);
+        assert!(pdb.starts_with("ATOM  "));
+        assert!(pdb.contains(" ALA A   1 "));
+        assert!(pdb.contains("   1.000   2.000   3.000"));
+        assert!(pdb.contains("  0.50 12.50"));
+        assert!(pdb.contains("CONECT    1    2"));
+        assert!(pdb.ends_with("END\n"));
+        assert!(!pdb.contains("HOH"));
+        assert!(!pdb.contains("CONECT    2    3"));
     }
 }
