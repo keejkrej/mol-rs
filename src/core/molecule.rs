@@ -203,7 +203,10 @@ impl Molecule {
             } else {
                 let prev = &self.atoms[i - 1];
                 let curr = &self.atoms[i];
-                prev.chain != curr.chain || prev.resi != curr.resi || prev.ins_code != curr.ins_code
+                prev.segi != curr.segi
+                    || prev.chain != curr.chain
+                    || prev.resi != curr.resi
+                    || prev.ins_code != curr.ins_code
             };
 
             // Track CA
@@ -217,6 +220,7 @@ impl Molecule {
             if new_residue {
                 let first = &self.atoms[start];
                 self.residues.push(ResidueRange {
+                    segi: first.segi.clone(),
                     chain: first.chain,
                     resn: first.resn.clone(),
                     resi: first.resi,
@@ -279,8 +283,9 @@ impl Molecule {
 }
 
 fn atom_sort_cmp(a: &AtomInfo, b: &AtomInfo) -> Ordering {
-    a.chain
-        .cmp(&b.chain)
+    a.segi
+        .cmp(&b.segi)
+        .then_with(|| a.chain.cmp(&b.chain))
         .then_with(|| a.is_hetatm.cmp(&b.is_hetatm))
         .then_with(|| a.resi.cmp(&b.resi))
         .then_with(|| a.ins_code.cmp(&b.ins_code))
@@ -469,5 +474,26 @@ mod tests {
         assert_eq!(mol.residues[0].atom_start, 0);
         assert_eq!(mol.residues[0].atom_end, 2);
         assert!(!mol.sort_atoms());
+    }
+
+    #[test]
+    fn build_residues_separates_segments() {
+        let mut mol = Molecule::new("segments".to_string());
+        mol.atoms = vec![
+            AtomInfo {
+                segi: "A".to_string(),
+                ..atom('A', 1, "N")
+            },
+            AtomInfo {
+                segi: "B".to_string(),
+                ..atom('A', 1, "CA")
+            },
+        ];
+
+        mol.build_residues();
+
+        assert_eq!(mol.residues.len(), 2);
+        assert_eq!(mol.residues[0].segi, "A");
+        assert_eq!(mol.residues[1].segi, "B");
     }
 }

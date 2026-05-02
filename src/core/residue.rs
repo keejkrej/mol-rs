@@ -4,6 +4,7 @@ use super::secondary_structure::SSType;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ResidueRange {
+    pub segi: String,
     pub chain: char,
     pub resn: String,
     pub resi: i32,
@@ -45,6 +46,35 @@ pub fn is_protein(resn: &str) -> bool {
             | "UNK"
             | "MSE"
     )
+}
+
+pub fn protein_one_letter(resn: &str) -> Option<char> {
+    match resn.trim().to_uppercase().as_str() {
+        "ALA" => Some('A'),
+        "ARG" => Some('R'),
+        "ASN" => Some('N'),
+        "ASP" => Some('D'),
+        "CYS" => Some('C'),
+        "GLN" => Some('Q'),
+        "GLU" => Some('E'),
+        "GLY" => Some('G'),
+        "HIS" => Some('H'),
+        "ILE" => Some('I'),
+        "LEU" => Some('L'),
+        "LYS" => Some('K'),
+        "MET" | "MSE" => Some('M'),
+        "PHE" => Some('F'),
+        "PRO" => Some('P'),
+        "SER" => Some('S'),
+        "THR" => Some('T'),
+        "TRP" => Some('W'),
+        "TYR" => Some('Y'),
+        "VAL" => Some('V'),
+        "ASX" => Some('B'),
+        "GLX" => Some('Z'),
+        "UNK" => Some('X'),
+        _ => None,
+    }
 }
 
 pub fn is_nucleic(resn: &str) -> bool {

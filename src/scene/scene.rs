@@ -4,7 +4,9 @@ use crate::core::bond::BondInfo;
 use crate::core::molecule::Molecule;
 use crate::render::camera::Camera;
 use crate::scene::color::{apply_color_scheme, ColorScheme};
-use crate::selection::{evaluate_with_coords, parser::Selector};
+use crate::selection::{
+    evaluate_with_coords, evaluator::named_selection_property_key, parser::Selector,
+};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -26,6 +28,8 @@ pub struct Scene {
     pub geometry_dirty: bool,
     /// Background color [r, g, b].
     pub bg_color: [f32; 3],
+    /// Stored named selections.
+    pub named_selections: BTreeSet<String>,
 }
 
 impl Default for Scene {
@@ -39,6 +43,7 @@ impl Default for Scene {
             all_states: false,
             geometry_dirty: false,
             bg_color: [0.0, 0.0, 0.0],
+            named_selections: BTreeSet::new(),
         }
     }
 }
@@ -80,6 +85,67 @@ impl Scene {
                 })
             })
             .count()
+    }
+
+    pub fn define_named_selection(
+        &mut self,
+        name: &str,
+        sel: &Selector,
+        state: usize,
+        merge: bool,
+    ) -> usize {
+        let key = named_selection_property_key(name);
+        let masks: Vec<Vec<bool>> = self
+            .molecules
+            .iter()
+            .map(|mol| evaluate_with_coords(sel, mol, mol.coords_for_state(state)))
+            .collect();
+        let mut count = 0usize;
+
+        for (mol, mask) in self.molecules.iter_mut().zip(masks.iter()) {
+            for (idx, atom) in mol.atoms.iter_mut().enumerate() {
+                let selected = mask.get(idx).copied().unwrap_or(false);
+                let keep_existing = merge && atom.properties.contains_key(&key);
+                if selected || keep_existing {
+                    atom.properties.insert(key.clone(), "1".to_string());
+                    count += 1;
+                } else {
+                    atom.properties.remove(&key);
+                }
+            }
+        }
+
+        self.named_selections.insert(name.to_string());
+        count
+    }
+
+    pub fn named_selection_names(&self) -> Vec<String> {
+        self.named_selections.iter().cloned().collect()
+    }
+
+    pub fn delete_named_selections(&mut self, pattern: &str) -> usize {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return 0;
+        }
+
+        let names: Vec<String> = self
+            .named_selections
+            .iter()
+            .filter(|name| object_name_matches(pattern, name))
+            .cloned()
+            .collect();
+        for name in &names {
+            let key = named_selection_property_key(name);
+            for mol in &mut self.molecules {
+                for atom in &mut mol.atoms {
+                    atom.properties.remove(&key);
+                }
+            }
+            self.named_selections.remove(name);
+        }
+
+        names.len()
     }
 
     pub fn set_state_clamped(&mut self, state: usize) {
@@ -244,6 +310,81 @@ impl Scene {
         self.set_state_clamped(self.current_state);
         self.geometry_dirty = true;
         created
+    }
+
+    /// Split matching multi-state objects into one single-state object per state.
+    pub fn split_states(
+        &mut self,
+        sel: &Selector,
+        first: usize,
+        last: Option<usize>,
+        prefix: Option<&str>,
+    ) -> usize {
+        if first == 0 || self.molecules.is_empty() {
+            return 0;
+        }
+
+        let source_indices: Vec<usize> = self
+            .molecules
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, mol)| {
+                let coords = mol.coords_for_state(self.current_state);
+                evaluate_with_coords(sel, mol, coords)
+                    .into_iter()
+                    .enumerate()
+                    .any(|(atom_idx, selected)| selected && atom_idx < coords.len())
+                    .then_some(idx)
+            })
+            .collect();
+
+        if source_indices.is_empty() {
+            return 0;
+        }
+
+        let mut used_names: BTreeSet<String> =
+            self.molecules.iter().map(|mol| mol.name.clone()).collect();
+        used_names.extend(self.named_selections.iter().cloned());
+
+        let mut created = Vec::new();
+        let mut prefix_index = first.saturating_sub(1);
+
+        for source_idx in source_indices {
+            let Some(source) = self.molecules.get(source_idx).cloned() else {
+                continue;
+            };
+            let source_state_count = source.coord_sets.len();
+            let last_state = last
+                .filter(|state| *state > 0)
+                .unwrap_or(source_state_count)
+                .min(source_state_count);
+            if first > last_state {
+                continue;
+            }
+
+            for state in first..=last_state {
+                let base_name = if let Some(prefix) = prefix {
+                    prefix_index += 1;
+                    format!("{}{:04}", prefix, prefix_index)
+                } else {
+                    format!("{}_{:04}", source.name, state)
+                };
+                let name = unique_object_name(&base_name, &mut used_names);
+                let mut split = source.clone();
+                split.name = name;
+                split.coord_sets = vec![source.coord_sets[state - 1].clone()];
+                created.push(split);
+            }
+        }
+
+        let count = created.len();
+        if count > 0 {
+            self.molecules.extend(created);
+            self.set_state_clamped(self.current_state);
+            self.geometry_dirty = true;
+        }
+
+        count
     }
 
     /// Recolor all molecules with the given scheme.
@@ -599,17 +740,20 @@ impl Scene {
     }
 
     pub fn object_type(&self, name: &str) -> Option<&'static str> {
-        self.molecules
-            .iter()
-            .any(|mol| mol.name == name)
-            .then_some("object:molecule")
+        if self.molecules.iter().any(|mol| mol.name == name) {
+            Some("object:molecule")
+        } else if self.named_selections.contains(name) {
+            Some("object:selection")
+        } else {
+            None
+        }
     }
 
     pub fn object_names_of_type(&self, object_type: &str) -> Vec<String> {
-        if object_type == "object:molecule" {
-            self.object_names(false, None, self.current_state)
-        } else {
-            Vec::new()
+        match object_type {
+            "object:molecule" => self.object_names(false, None, self.current_state),
+            "object:selection" => self.named_selection_names(),
+            _ => Vec::new(),
         }
     }
 
@@ -799,6 +943,21 @@ fn object_name_matches(pattern: &str, name: &str) -> bool {
 
 fn is_all_object_pattern(pattern: &str) -> bool {
     pattern.eq_ignore_ascii_case("all") || pattern == "*"
+}
+
+fn unique_object_name(base: &str, used_names: &mut BTreeSet<String>) -> String {
+    if used_names.insert(base.to_string()) {
+        return base.to_string();
+    }
+
+    for idx in 1.. {
+        let candidate = format!("{}_{:04}", base, idx);
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded unique object name search should return")
 }
 
 fn set_camera_clip(camera_near: &mut f32, camera_far: &mut f32, near: f32, far: f32) {
@@ -1228,8 +1387,10 @@ mod tests {
     fn object_type_reports_molecule_objects() {
         let mut scene = Scene::default();
         scene.molecules.push(Molecule::new("mol1".to_string()));
+        scene.named_selections.insert("sele1".to_string());
 
         assert_eq!(scene.object_type("mol1"), Some("object:molecule"));
+        assert_eq!(scene.object_type("sele1"), Some("object:selection"));
         assert_eq!(scene.object_type("missing"), None);
     }
 
@@ -1238,12 +1399,32 @@ mod tests {
         let mut scene = Scene::default();
         scene.molecules.push(Molecule::new("mol1".to_string()));
         scene.molecules.push(Molecule::new("mol2".to_string()));
+        scene.named_selections.insert("sele1".to_string());
 
         assert_eq!(
             scene.object_names_of_type("object:molecule"),
             vec!["mol1".to_string(), "mol2".to_string()]
         );
+        assert_eq!(
+            scene.object_names_of_type("object:selection"),
+            vec!["sele1".to_string()]
+        );
         assert!(scene.object_names_of_type("object:map").is_empty());
+    }
+
+    #[test]
+    fn delete_named_selections_removes_atom_membership() {
+        let mut scene = Scene::default();
+        let mut mol = Molecule::new("mol".to_string());
+        mol.atoms = vec![atom('A', 1), atom('B', 2)];
+        let key = named_selection_property_key("sele1");
+        mol.atoms[0].properties.insert(key.clone(), "1".to_string());
+        scene.molecules.push(mol);
+        scene.named_selections.insert("sele1".to_string());
+
+        assert_eq!(scene.delete_named_selections("sele*"), 1);
+        assert!(scene.named_selections.is_empty());
+        assert!(!scene.molecules[0].atoms[0].properties.contains_key(&key));
     }
 
     #[test]

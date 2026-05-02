@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use glam::{Quat, Vec3};
 
-use crate::core::atom::{REP_ALL, REP_CARTOON, REP_LINES, REP_SPHERES, REP_STICKS};
+use crate::core::atom::{AtomInfo, REP_ALL, REP_CARTOON, REP_LINES, REP_SPHERES, REP_STICKS};
+use crate::core::element::{element_by_symbol, ELEMENTS};
+use crate::core::secondary_structure::SSType;
 use crate::io::pdb::{write_pdb, PdbWriteSource};
 use crate::scene::scene::{
     AtomId, AtomIndex, ClipError, ClipMode, Measurement, OrderLocation, RenameObjectError,
@@ -13,6 +15,13 @@ use crate::selection::{
 };
 
 use super::MolApp;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlagAction {
+    Reset,
+    Set,
+    Clear,
+}
 
 impl MolApp {
     /// Parse "rep_name, selection_expr" from a comma-separated argument string.
@@ -35,6 +44,303 @@ impl MolApp {
             )
         } else {
             (args.trim().to_string(), String::new())
+        }
+    }
+
+    fn parse_flag_args(args: &str) -> Result<(u8, Selector, FlagAction), String> {
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        if parts.len() < 2 || parts.len() > 3 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err("Usage: flag <flag>, <selection> [, reset|set|clear]".to_string());
+        }
+
+        let flag = Self::parse_atom_flag(parts[0])?;
+        let sel = parse_selection(parts[1]).map_err(|e| format!("Selection error: {}", e))?;
+        let action = if let Some(action) = parts.get(2) {
+            Self::parse_flag_action(action)?
+        } else {
+            FlagAction::Reset
+        };
+        Ok((flag, sel, action))
+    }
+
+    fn parse_label_args(args: &str) -> Result<(Selector, String), String> {
+        let (selection, expression) = if let Some(comma) = args.find(',') {
+            (&args[..comma], &args[comma + 1..])
+        } else {
+            (args, "")
+        };
+
+        let selection = selection.trim();
+        let selection = if selection.is_empty() {
+            "all"
+        } else {
+            selection
+        };
+        let sel = parse_selection(selection).map_err(|e| format!("Selection error: {}", e))?;
+        Ok((sel, expression.trim().to_string()))
+    }
+
+    fn parse_iterate_args(args: &str) -> Result<(Selector, String), String> {
+        let Some((selection, expression)) = args.split_once(',') else {
+            return Err("Usage: iterate <selection>, <field>".to_string());
+        };
+        let selection = selection.trim();
+        let expression = expression.trim();
+        if selection.is_empty() || expression.is_empty() {
+            return Err("Usage: iterate <selection>, <field>".to_string());
+        }
+        let sel = parse_selection(selection).map_err(|e| format!("Selection error: {}", e))?;
+        Ok((sel, expression.to_string()))
+    }
+
+    fn parse_iterate_state_args(args: &str) -> Result<(isize, Selector, String), String> {
+        let usage = "Usage: iterate_state <state>, <selection>, <field>";
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        if parts.len() < 3 || parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
+            return Err(usage.to_string());
+        }
+
+        let state = parts[0].parse::<isize>().map_err(|_| usage.to_string())?;
+        let sel = parse_selection(parts[1]).map_err(|e| format!("Selection error: {}", e))?;
+        let expression = parts[2..].join(",").trim().to_string();
+        if expression.is_empty() {
+            return Err(usage.to_string());
+        }
+
+        Ok((state, sel, expression))
+    }
+
+    fn parse_alter_args(args: &str) -> Result<(Selector, String, String), String> {
+        let Some((selection, expression)) = args.split_once(',') else {
+            return Err("Usage: alter <selection>, <field>=<value>".to_string());
+        };
+        let Some((field, value)) = expression.split_once('=') else {
+            return Err("Usage: alter <selection>, <field>=<value>".to_string());
+        };
+
+        let selection = selection.trim();
+        let field = field.trim();
+        let value = value.trim();
+        if selection.is_empty() || field.is_empty() || value.is_empty() {
+            return Err("Usage: alter <selection>, <field>=<value>".to_string());
+        }
+
+        let sel = parse_selection(selection).map_err(|e| format!("Selection error: {}", e))?;
+        Ok((sel, field.to_string(), value.to_string()))
+    }
+
+    fn parse_alter_state_args(args: &str) -> Result<(isize, Selector, String, f32), String> {
+        let usage = "Usage: alter_state <state>, <selection>, <x|y|z>=<value>";
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        if parts.len() < 3 || parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
+            return Err(usage.to_string());
+        }
+
+        let state = parts[0].parse::<isize>().map_err(|_| usage.to_string())?;
+        let sel = parse_selection(parts[1]).map_err(|e| format!("Selection error: {}", e))?;
+        let expression = parts[2..].join(",");
+        let Some((field, value)) = expression.split_once('=') else {
+            return Err(usage.to_string());
+        };
+        let field = field.trim().to_ascii_lowercase();
+        if !matches!(field.as_str(), "x" | "y" | "z") {
+            return Err(usage.to_string());
+        }
+        let value = Self::alter_string_value(value.trim())
+            .parse::<f32>()
+            .map_err(|_| usage.to_string())?;
+
+        Ok((state, sel, field, value))
+    }
+
+    fn parse_translate_args(args: &str) -> Result<([f32; 3], Selector, isize), String> {
+        let usage = "Usage: translate [x,y,z] [, selection [, state]]";
+        let args = args.trim();
+        if args.is_empty() {
+            return Err(usage.to_string());
+        }
+
+        let (vector_text, rest) = if let Some(stripped) = args.strip_prefix('[') {
+            let Some(end) = stripped.find(']') else {
+                return Err(usage.to_string());
+            };
+            (&stripped[..end], stripped[end + 1..].trim())
+        } else if let Some(comma) = args.find(',') {
+            (&args[..comma], args[comma..].trim())
+        } else {
+            (args, "")
+        };
+
+        let vector = Self::parse_vector3(vector_text).map_err(|_| usage.to_string())?;
+        let rest = rest.strip_prefix(',').unwrap_or(rest).trim();
+        let parts: Vec<&str> = if rest.is_empty() {
+            Vec::new()
+        } else {
+            rest.split(',').map(str::trim).collect()
+        };
+        if parts.len() > 3 {
+            return Err(usage.to_string());
+        }
+
+        let sel = parse_selection(parts.first().copied().unwrap_or(""))
+            .map_err(|e| format!("Selection error: {}", e))?;
+        let state = parts
+            .get(1)
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<isize>().map_err(|_| usage.to_string()))
+            .transpose()?
+            .unwrap_or(-1);
+
+        Ok((vector, sel, state))
+    }
+
+    fn parse_rotate_args(args: &str) -> Result<([f32; 3], f32, Selector, isize, [f32; 3]), String> {
+        let usage = "Usage: rotate <x|y|z|[x,y,z]>, <angle> [, selection [, state [, origin]]]";
+        let args = args.trim();
+        if args.is_empty() {
+            return Err(usage.to_string());
+        }
+
+        let (axis_text, rest) = if let Some(stripped) = args.strip_prefix('[') {
+            let Some(end) = stripped.find(']') else {
+                return Err(usage.to_string());
+            };
+            (&stripped[..end], stripped[end + 1..].trim())
+        } else {
+            let Some(comma) = args.find(',') else {
+                return Err(usage.to_string());
+            };
+            (&args[..comma], args[comma..].trim())
+        };
+
+        let axis = Self::parse_axis(axis_text).map_err(|_| usage.to_string())?;
+        let rest = rest.strip_prefix(',').unwrap_or(rest).trim();
+        let parts: Vec<&str> = if rest.is_empty() {
+            Vec::new()
+        } else {
+            rest.split(',').map(str::trim).collect()
+        };
+        if parts.is_empty() || parts.len() > 4 || parts[0].is_empty() {
+            return Err(usage.to_string());
+        }
+
+        let angle = parts[0].parse::<f32>().map_err(|_| usage.to_string())?;
+        let sel = parse_selection(parts.get(1).copied().unwrap_or(""))
+            .map_err(|e| format!("Selection error: {}", e))?;
+        let state = parts
+            .get(2)
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<isize>().map_err(|_| usage.to_string()))
+            .transpose()?
+            .unwrap_or(-1);
+        let origin = parts
+            .get(3)
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let part = part
+                    .trim()
+                    .strip_prefix('[')
+                    .unwrap_or(part.trim())
+                    .strip_suffix(']')
+                    .unwrap_or(part.trim());
+                Self::parse_vector3(part).map_err(|_| usage.to_string())
+            })
+            .transpose()?
+            .unwrap_or([0.0, 0.0, 0.0]);
+
+        Ok((axis, angle, sel, state, origin))
+    }
+
+    fn parse_axis(value: &str) -> Result<[f32; 3], String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "x" => Ok([1.0, 0.0, 0.0]),
+            "y" => Ok([0.0, 1.0, 0.0]),
+            "z" => Ok([0.0, 0.0, 1.0]),
+            _ => {
+                let axis = Self::parse_vector3(value)?;
+                let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+                if length == 0.0 {
+                    Err(value.to_string())
+                } else {
+                    Ok(axis)
+                }
+            }
+        }
+    }
+
+    fn parse_vector3(value: &str) -> Result<[f32; 3], String> {
+        let values: Vec<f32> = value
+            .split(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse::<f32>().map_err(|_| value.to_string()))
+            .collect::<Result<_, _>>()?;
+        if values.len() == 3 {
+            Ok([values[0], values[1], values[2]])
+        } else {
+            Err(value.to_string())
+        }
+    }
+
+    fn parse_select_args(args: &str) -> Result<Option<(String, Selector, bool)>, String> {
+        if args.contains(',') {
+            let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+            let name = parts.first().copied().unwrap_or("");
+            let selection = parts.get(1).copied().unwrap_or("");
+            if name.is_empty() || selection.is_empty() {
+                return Err("Usage: select [name,] <selection> [, merge|replace]".to_string());
+            }
+            let sel = parse_selection(selection).map_err(|e| format!("Selection error: {}", e))?;
+            let mut merge = false;
+            for option in parts.iter().skip(2).filter(|part| !part.is_empty()) {
+                let value = option
+                    .split_once('=')
+                    .map_or(*option, |(_, value)| value.trim())
+                    .to_ascii_lowercase();
+                match value.as_str() {
+                    "merge" | "add" | "or" | "true" | "on" => merge = true,
+                    "replace" | "set" | "reset" | "false" | "off" => merge = false,
+                    _ => {
+                        return Err(
+                            "Usage: select [name,] <selection> [, merge|replace]".to_string()
+                        )
+                    }
+                }
+            }
+            Ok(Some((name.to_string(), sel, merge)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_atom_flag(flag: &str) -> Result<u8, String> {
+        let flag = match flag.trim().to_ascii_lowercase().as_str() {
+            "focus" => 0,
+            "free" => 1,
+            "restrain" => 2,
+            "fix" => 3,
+            "exclude" => 4,
+            "study" => 5,
+            "exfoliate" => 24,
+            "ignore" => 25,
+            "no_smooth" => 26,
+            value => value
+                .parse()
+                .map_err(|_| format!("Unknown flag: '{}'", flag.trim()))?,
+        };
+
+        if flag <= 31 {
+            Ok(flag)
+        } else {
+            Err(format!("flag {} out of range [0, 31]", flag))
+        }
+    }
+
+    fn parse_flag_action(action: &str) -> Result<FlagAction, String> {
+        match action.trim().to_ascii_lowercase().as_str() {
+            "reset" => Ok(FlagAction::Reset),
+            "set" => Ok(FlagAction::Set),
+            "clear" => Ok(FlagAction::Clear),
+            _ => Err(format!("Unknown flag action: '{}'", action.trim())),
         }
     }
 
@@ -181,6 +487,70 @@ impl MolApp {
             .flatten();
 
         Ok((parts[0].to_string(), sel, source_state))
+    }
+
+    fn parse_split_states_args(
+        args: &str,
+        usage: &str,
+    ) -> Result<(Selector, usize, Option<usize>, Option<String>), String> {
+        let parts: Vec<&str> = args.split(',').map(str::trim).collect();
+        let object = parts.first().copied().unwrap_or("");
+        if object.is_empty() {
+            return Err(usage.to_string());
+        }
+
+        let sel = parse_selection(object)?;
+        let mut first = 1usize;
+        let mut last = None;
+        let mut prefix = None;
+        let mut positional = 0usize;
+
+        for part in parts.iter().skip(1).filter(|part| !part.is_empty()) {
+            let (key, value) = part
+                .split_once('=')
+                .map(|(key, value)| (Some(key.trim().to_ascii_lowercase()), value.trim()))
+                .unwrap_or((None, *part));
+
+            match key.as_deref() {
+                Some("first") => {
+                    first = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                    if first == 0 {
+                        return Err(usage.to_string());
+                    }
+                }
+                Some("last") => {
+                    let parsed = value.parse::<isize>().map_err(|_| usage.to_string())?;
+                    last = (parsed > 0).then_some(parsed as usize);
+                }
+                Some("prefix") => {
+                    prefix = Some(Self::alter_string_value(value));
+                }
+                Some(_) => return Err(usage.to_string()),
+                None => {
+                    positional += 1;
+                    match positional {
+                        1 => {
+                            first = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                            if first == 0 {
+                                return Err(usage.to_string());
+                            }
+                        }
+                        2 => {
+                            let parsed = value.parse::<isize>().map_err(|_| usage.to_string())?;
+                            last = (parsed > 0).then_some(parsed as usize);
+                        }
+                        3 => prefix = Some(Self::alter_string_value(value)),
+                        _ => return Err(usage.to_string()),
+                    }
+                }
+            }
+        }
+
+        if prefix.as_ref().is_some_and(|prefix| prefix.is_empty()) {
+            prefix = None;
+        }
+
+        Ok((sel, first, last, prefix))
     }
 
     fn parse_count_atoms_args(args: &str) -> Result<(Selector, Option<usize>), String> {
@@ -356,6 +726,19 @@ impl MolApp {
         }
     }
 
+    fn get_names_includes_selections(name_type: &str) -> Result<bool, String> {
+        match name_type {
+            "all" | "public" | "selections" | "public_selections" => Ok(true),
+            "objects"
+            | "public_objects"
+            | "public_nongroup_objects"
+            | "nongroup_objects"
+            | "public_group_objects"
+            | "group_objects" => Ok(false),
+            _ => Err(format!("Unknown name type: '{}'", name_type)),
+        }
+    }
+
     fn parse_type_public_args(args: &str, usage: &str) -> Result<(String, bool), String> {
         let parts: Vec<&str> = args.split(',').map(str::trim).collect();
         let object_type = parts.first().copied().unwrap_or("");
@@ -415,6 +798,319 @@ impl MolApp {
             "salmon" => Some([1.0, 0.6, 0.5]),
             "purple" => Some([0.6, 0.2, 0.8]),
             _ => None,
+        }
+    }
+
+    fn eval_label_expression(
+        expression: &str,
+        atom: &crate::core::atom::AtomInfo,
+        idx: usize,
+        model: &str,
+    ) -> String {
+        let expression = expression.trim();
+        if expression.is_empty() {
+            return String::new();
+        }
+
+        if let Some(unquoted) = Self::unquote_label_literal(expression) {
+            return unquoted.to_string();
+        }
+
+        match expression {
+            "name" => atom.name.trim().to_string(),
+            "resn" => atom.resn.trim().to_string(),
+            "resi" | "resv" => atom.resi.to_string(),
+            "chain" => atom.chain.to_string().trim().to_string(),
+            "segi" => atom.segi.trim().to_string(),
+            "model" => model.to_string(),
+            "alt" => atom.alt.to_string().trim().to_string(),
+            "q" => atom.occupancy.to_string(),
+            "b" => atom.b_factor.to_string(),
+            "type" | "text_type" => atom.text_type.trim().to_string(),
+            "index" => (idx + 1).to_string(),
+            "rank" => atom.rank.to_string(),
+            "ID" | "id" => {
+                if atom.serial == 0 {
+                    (idx + 1).to_string()
+                } else {
+                    atom.serial.to_string()
+                }
+            }
+            "ss" => format!("{:?}", atom.ss_type),
+            "vdw" => atom.vdw.to_string(),
+            "label" => atom.label.clone(),
+            "elem" => atom.elem_symbol.trim().to_string(),
+            "flags" => atom.flags.to_string(),
+            "formal_charge" => atom.formal_charge.to_string(),
+            "partial_charge" => atom.partial_charge.to_string(),
+            "numeric_type" => atom.numeric_type.to_string(),
+            "stereo" => atom.stereo.trim().to_string(),
+            _ => expression.to_string(),
+        }
+    }
+
+    fn eval_iterate_expression(
+        expression: &str,
+        atom: &crate::core::atom::AtomInfo,
+        idx: usize,
+        model: &str,
+    ) -> String {
+        let expression = expression.trim();
+        let expression = expression
+            .strip_prefix("print(")
+            .and_then(|inner| inner.strip_suffix(')'))
+            .unwrap_or(expression)
+            .trim();
+        Self::eval_label_expression(expression, atom, idx, model)
+    }
+
+    fn eval_iterate_state_expression(
+        expression: &str,
+        atom: &crate::core::atom::AtomInfo,
+        idx: usize,
+        model: &str,
+        coord: [f32; 3],
+    ) -> String {
+        let expression = expression.trim();
+        let expression = expression
+            .strip_prefix("print(")
+            .and_then(|inner| inner.strip_suffix(')'))
+            .unwrap_or(expression)
+            .trim();
+        match expression {
+            "x" => coord[0].to_string(),
+            "y" => coord[1].to_string(),
+            "z" => coord[2].to_string(),
+            _ => Self::eval_label_expression(expression, atom, idx, model),
+        }
+    }
+
+    fn unquote_label_literal(expression: &str) -> Option<&str> {
+        let mut chars = expression.chars();
+        let quote = chars.next()?;
+        if quote != '\'' && quote != '"' {
+            return None;
+        }
+        if !expression.ends_with(quote) || expression.len() < 2 {
+            return None;
+        }
+        Some(&expression[quote.len_utf8()..expression.len() - quote.len_utf8()])
+    }
+
+    fn alter_string_value(value: &str) -> String {
+        Self::unquote_label_literal(value)
+            .unwrap_or(value)
+            .to_string()
+    }
+
+    fn alter_char_value(value: &str) -> Result<char, String> {
+        let value = Self::alter_string_value(value);
+        if value.is_empty() {
+            return Ok(' ');
+        }
+        let mut chars = value.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next()) {
+            Ok(ch)
+        } else {
+            Err(format!("Expected a single character, got '{}'", value))
+        }
+    }
+
+    fn alter_bool_value(value: &str) -> Result<bool, String> {
+        match Self::alter_string_value(value)
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "1" | "true" | "on" | "yes" => Ok(true),
+            "0" | "false" | "off" | "no" => Ok(false),
+            _ => Err(format!("Expected boolean value, got '{}'", value.trim())),
+        }
+    }
+
+    fn alter_optional_color(value: &str) -> Result<Option<[f32; 3]>, String> {
+        let value = Self::alter_string_value(value).to_ascii_lowercase();
+        if matches!(value.as_str(), "none" | "default" | "-1") {
+            return Ok(None);
+        }
+        Self::parse_color(&value)
+            .map(Some)
+            .ok_or_else(|| format!("Unknown color: '{}'", value))
+    }
+
+    fn alter_ss_value(value: &str) -> Result<SSType, String> {
+        match Self::alter_string_value(value)
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "H" | "HELIX" => Ok(SSType::Helix),
+            "S" | "E" | "SHEET" | "STRAND" => Ok(SSType::Sheet),
+            "L" | "LOOP" | "" => Ok(SSType::Loop),
+            _ => Err(format!("Unknown secondary structure: '{}'", value.trim())),
+        }
+    }
+
+    fn apply_alter_assignment(
+        atom: &mut AtomInfo,
+        field: &str,
+        value: &str,
+    ) -> Result<bool, String> {
+        let field = field.trim().to_ascii_lowercase();
+        match field.as_str() {
+            "name" => {
+                atom.name = Self::alter_string_value(value);
+                Ok(true)
+            }
+            "resn" | "resname" => {
+                atom.resn = Self::alter_string_value(value);
+                Ok(true)
+            }
+            "resi" | "resv" => {
+                atom.resi = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(true)
+            }
+            "chain" => {
+                atom.chain = Self::alter_char_value(value)?;
+                Ok(true)
+            }
+            "segi" | "segment" | "segid" => {
+                atom.segi = Self::alter_string_value(value);
+                Ok(true)
+            }
+            "ins_code" | "ins" => {
+                atom.ins_code = Self::alter_char_value(value)?;
+                Ok(true)
+            }
+            "alt" | "altloc" => {
+                atom.alt = Self::alter_char_value(value)?;
+                Ok(false)
+            }
+            "b" | "b_factor" => {
+                atom.b_factor = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid float: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "q" | "occupancy" => {
+                atom.occupancy = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid float: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "formal_charge" | "fc" => {
+                atom.formal_charge = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "partial_charge" | "pc" => {
+                atom.partial_charge = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid float: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "vdw" => {
+                atom.vdw = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid float: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "elec_radius" => {
+                atom.elec_radius = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid float: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "text_type" | "type" => {
+                atom.text_type = Self::alter_string_value(value);
+                Ok(false)
+            }
+            "numeric_type" => {
+                atom.numeric_type = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "custom" => {
+                atom.custom = Self::alter_string_value(value);
+                Ok(false)
+            }
+            "label" => {
+                atom.label = Self::alter_string_value(value);
+                Ok(false)
+            }
+            "stereo" => {
+                atom.stereo = Self::alter_string_value(value);
+                Ok(false)
+            }
+            "elem" | "element" | "symbol" => {
+                let symbol = Self::alter_string_value(value);
+                let Some(elem) = element_by_symbol(&symbol) else {
+                    return Err(format!("Unknown element: '{}'", symbol));
+                };
+                atom.elem_symbol = elem.symbol.to_string();
+                atom.element = ELEMENTS
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, elem))
+                    .unwrap_or(0) as u8;
+                atom.vdw = elem.vdw;
+                Ok(false)
+            }
+            "cartoon" => {
+                atom.cartoon = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "geom" => {
+                atom.geom = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "valence" => {
+                atom.valence = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "flags" => {
+                atom.flags = Self::alter_string_value(value)
+                    .parse()
+                    .map_err(|_| format!("Invalid integer: '{}'", value.trim()))?;
+                Ok(false)
+            }
+            "masked" => {
+                atom.masked = Self::alter_bool_value(value)?;
+                Ok(false)
+            }
+            "protected" => {
+                atom.protected = Self::alter_bool_value(value)?;
+                Ok(false)
+            }
+            "hetatm" | "is_hetatm" => {
+                atom.is_hetatm = Self::alter_bool_value(value)?;
+                Ok(true)
+            }
+            "ss" => {
+                atom.ss_type = Self::alter_ss_value(value)?;
+                Ok(false)
+            }
+            "color" => {
+                atom.color = Self::alter_optional_color(value)?
+                    .ok_or_else(|| "color cannot be cleared".to_string())?;
+                Ok(false)
+            }
+            "cartoon_color" => {
+                atom.cartoon_color = Self::alter_optional_color(value)?;
+                Ok(false)
+            }
+            "ribbon_color" => {
+                atom.ribbon_color = Self::alter_optional_color(value)?;
+                Ok(false)
+            }
+            _ => Err(format!("Unsupported alter field: '{}'", field)),
         }
     }
 
@@ -597,6 +1293,21 @@ impl MolApp {
                 self.command_line
                     .log(format!("{} {}: {} atoms", verb, name, created));
             }
+            "split_states" => {
+                let usage = "Usage: split_states <object> [, first [, last [, prefix]]]";
+                let (sel, first, last, prefix) = match Self::parse_split_states_args(args, usage) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let count = self
+                    .scene
+                    .split_states(&sel, first, last, prefix.as_deref());
+                self.command_line
+                    .log(format!("split_states {}: {} object(s)", args, count));
+            }
             "show" => {
                 let (rep_name, sel_str) = Self::parse_showhide_selection(args, "wire");
                 let flag = match Self::representation_mask(&rep_name) {
@@ -734,8 +1445,422 @@ impl MolApp {
                 self.command_line
                     .log(format!("color {}: {} atoms", color_name, total));
             }
+            "label" => {
+                let (sel, expression) = match Self::parse_label_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let mut total = 0usize;
+                let current_state = self.scene.current_state;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate_with_coords(&sel, mol, mol.coords_for_state(current_state));
+                    let model_name = mol.name.clone();
+                    for (idx, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask[idx] {
+                            atom.label =
+                                Self::eval_label_expression(&expression, atom, idx, &model_name);
+                            total += 1;
+                        }
+                    }
+                }
+                self.command_line.log(format!("label: {} atoms", total));
+            }
+            "alter" => {
+                let (sel, field, value) = match Self::parse_alter_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let mut total = 0usize;
+                let mut any_rebuild = false;
+                let current_state = self.scene.current_state;
+
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate_with_coords(&sel, mol, mol.coords_for_state(current_state));
+                    let mut rebuild_residues = false;
+                    for (idx, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask.get(idx).copied().unwrap_or(false) {
+                            match Self::apply_alter_assignment(atom, &field, &value) {
+                                Ok(rebuild) => {
+                                    rebuild_residues |= rebuild;
+                                    total += 1;
+                                }
+                                Err(e) => {
+                                    self.command_line.log(e);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if rebuild_residues {
+                        mol.build_residues();
+                        any_rebuild = true;
+                    }
+                }
+
+                if total > 0 {
+                    self.scene.geometry_dirty = true;
+                }
+                let rebuilt = if any_rebuild {
+                    " (residues rebuilt)"
+                } else {
+                    ""
+                };
+                self.command_line
+                    .log(format!("alter: {} atoms{}", total, rebuilt));
+            }
+            "alter_state" => {
+                let (state, sel, field, value) = match Self::parse_alter_state_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let axis = match field.as_str() {
+                    "x" => 0,
+                    "y" => 1,
+                    "z" => 2,
+                    _ => unreachable!("parse_alter_state_args validates coordinate fields"),
+                };
+                let current_state = self.scene.current_state;
+                let mut total = 0usize;
+
+                for mol in &mut self.scene.molecules {
+                    let state_indices: Vec<usize> = if state == 0 {
+                        (0..mol.coord_sets.len()).collect()
+                    } else {
+                        let state_1_based = if state < 0 {
+                            current_state
+                        } else {
+                            state as usize
+                        };
+                        if state_1_based == 0 || state_1_based > mol.coord_sets.len() {
+                            Vec::new()
+                        } else {
+                            vec![state_1_based - 1]
+                        }
+                    };
+
+                    for state_idx in state_indices {
+                        let coords = mol.coord_sets[state_idx].clone();
+                        let mask = evaluate_with_coords(&sel, mol, &coords);
+                        for (idx, coord) in mol.coord_sets[state_idx].iter_mut().enumerate() {
+                            if mask.get(idx).copied().unwrap_or(false) {
+                                coord[axis] = value;
+                                total += 1;
+                            }
+                        }
+                    }
+                }
+
+                if total > 0 {
+                    self.scene.geometry_dirty = true;
+                }
+                self.command_line
+                    .log(format!("alter_state: {} coordinates", total));
+            }
+            "iterate" => {
+                let (sel, expression) = match Self::parse_iterate_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let current_state = self.scene.current_state;
+                let mut values = Vec::new();
+
+                for mol in &self.scene.molecules {
+                    let coords = mol.coords_for_state(current_state);
+                    let mask = evaluate_with_coords(&sel, mol, coords);
+                    let model_name = mol.name.clone();
+                    for (idx, atom) in mol.atoms.iter().enumerate() {
+                        if idx < coords.len() && mask.get(idx).copied().unwrap_or(false) {
+                            values.push(Self::eval_iterate_expression(
+                                &expression,
+                                atom,
+                                idx,
+                                &model_name,
+                            ));
+                        }
+                    }
+                }
+
+                self.command_line.log(format!(
+                    "cmd.iterate: {}",
+                    Self::format_string_list(&values)
+                ));
+            }
+            "iterate_state" => {
+                let (state, sel, expression) = match Self::parse_iterate_state_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let current_state = self.scene.current_state;
+                let mut values = Vec::new();
+
+                for mol in &self.scene.molecules {
+                    let state_indices: Vec<usize> = if state == 0 {
+                        (0..mol.coord_sets.len()).collect()
+                    } else {
+                        let state_1_based = if state < 0 {
+                            current_state
+                        } else {
+                            state as usize
+                        };
+                        if state_1_based == 0 || state_1_based > mol.coord_sets.len() {
+                            Vec::new()
+                        } else {
+                            vec![state_1_based - 1]
+                        }
+                    };
+
+                    let model_name = mol.name.clone();
+                    for state_idx in state_indices {
+                        let coords = &mol.coord_sets[state_idx];
+                        let mask = evaluate_with_coords(&sel, mol, coords);
+                        for (idx, coord) in coords.iter().copied().enumerate() {
+                            if mask.get(idx).copied().unwrap_or(false) {
+                                if let Some(atom) = mol.atoms.get(idx) {
+                                    values.push(Self::eval_iterate_state_expression(
+                                        &expression,
+                                        atom,
+                                        idx,
+                                        &model_name,
+                                        coord,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                self.command_line.log(format!(
+                    "cmd.iterate_state: {}",
+                    Self::format_string_list(&values)
+                ));
+            }
+            "translate" => {
+                let (vector, sel, state) = match Self::parse_translate_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let current_state = self.scene.current_state;
+                let mut total = 0usize;
+
+                for mol in &mut self.scene.molecules {
+                    let state_indices: Vec<usize> = if state == 0 {
+                        (0..mol.coord_sets.len()).collect()
+                    } else {
+                        let state_1_based = if state < 0 {
+                            current_state
+                        } else {
+                            state as usize
+                        };
+                        if state_1_based == 0 || state_1_based > mol.coord_sets.len() {
+                            Vec::new()
+                        } else {
+                            vec![state_1_based - 1]
+                        }
+                    };
+
+                    for state_idx in state_indices {
+                        let coords = mol.coord_sets[state_idx].clone();
+                        let mask = evaluate_with_coords(&sel, mol, &coords);
+                        for (idx, coord) in mol.coord_sets[state_idx].iter_mut().enumerate() {
+                            if mask.get(idx).copied().unwrap_or(false) {
+                                coord[0] += vector[0];
+                                coord[1] += vector[1];
+                                coord[2] += vector[2];
+                                total += 1;
+                            }
+                        }
+                    }
+                }
+
+                if total > 0 {
+                    self.scene.geometry_dirty = true;
+                }
+                self.command_line
+                    .log(format!("translate: {} coordinates", total));
+            }
+            "rotate" => {
+                let (axis, angle, sel, state, origin) = match Self::parse_rotate_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let axis = Vec3::from_array(axis).normalize();
+                let rotation = Quat::from_axis_angle(axis, angle.to_radians());
+                let origin = Vec3::from_array(origin);
+                let current_state = self.scene.current_state;
+                let mut total = 0usize;
+
+                for mol in &mut self.scene.molecules {
+                    let state_indices: Vec<usize> = if state == 0 {
+                        (0..mol.coord_sets.len()).collect()
+                    } else {
+                        let state_1_based = if state < 0 {
+                            current_state
+                        } else {
+                            state as usize
+                        };
+                        if state_1_based == 0 || state_1_based > mol.coord_sets.len() {
+                            Vec::new()
+                        } else {
+                            vec![state_1_based - 1]
+                        }
+                    };
+
+                    for state_idx in state_indices {
+                        let coords = mol.coord_sets[state_idx].clone();
+                        let mask = evaluate_with_coords(&sel, mol, &coords);
+                        for (idx, coord) in mol.coord_sets[state_idx].iter_mut().enumerate() {
+                            if mask.get(idx).copied().unwrap_or(false) {
+                                let point = Vec3::from_array(*coord);
+                                *coord = (origin + rotation * (point - origin)).to_array();
+                                total += 1;
+                            }
+                        }
+                    }
+                }
+
+                if total > 0 {
+                    self.scene.geometry_dirty = true;
+                }
+                self.command_line
+                    .log(format!("rotate: {} coordinates", total));
+            }
+            "flag" => {
+                let (flag, sel, action) = match Self::parse_flag_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let bit = 1u32 << flag;
+                let mut selected = 0usize;
+                let mut visited = 0usize;
+                let current_state = self.scene.current_state;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate_with_coords(&sel, mol, mol.coords_for_state(current_state));
+                    for (i, atom) in mol.atoms.iter_mut().enumerate() {
+                        let is_selected = mask[i];
+                        if matches!(action, FlagAction::Reset) {
+                            atom.flags &= !bit;
+                            visited += 1;
+                        }
+                        if is_selected {
+                            match action {
+                                FlagAction::Reset | FlagAction::Set => atom.flags |= bit,
+                                FlagAction::Clear => atom.flags &= !bit,
+                            }
+                            selected += 1;
+                        }
+                    }
+                }
+                match action {
+                    FlagAction::Reset => self.command_line.log(format!(
+                        "Flag: flag {} is set in {} of {} atoms.",
+                        flag, selected, visited
+                    )),
+                    FlagAction::Set => self
+                        .command_line
+                        .log(format!("Flag: flag {} set on {} atoms.", flag, selected)),
+                    FlagAction::Clear => self.command_line.log(format!(
+                        "Flag: flag {} cleared on {} atoms.",
+                        flag, selected
+                    )),
+                }
+            }
+            "mask" | "unmask" => {
+                let sel = match parse_selection(args) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.command_line.log(format!("Selection error: {}", e));
+                        return;
+                    }
+                };
+                let masked = verb == "mask";
+                let mut total = 0usize;
+                let current_state = self.scene.current_state;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate_with_coords(&sel, mol, mol.coords_for_state(current_state));
+                    for (i, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask[i] {
+                            atom.masked = masked;
+                            total += 1;
+                        }
+                    }
+                }
+                let label = if masked { "masked" } else { "unmasked" };
+                self.command_line
+                    .log(format!("Mask: {} atoms {}.", total, label));
+            }
+            "protect" | "deprotect" => {
+                let sel = match parse_selection(args) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.command_line.log(format!("Selection error: {}", e));
+                        return;
+                    }
+                };
+                let protected = verb == "protect";
+                let mut total = 0usize;
+                let current_state = self.scene.current_state;
+                for mol in &mut self.scene.molecules {
+                    let mask = evaluate_with_coords(&sel, mol, mol.coords_for_state(current_state));
+                    for (i, atom) in mol.atoms.iter_mut().enumerate() {
+                        if mask[i] {
+                            atom.protected = protected;
+                            total += 1;
+                        }
+                    }
+                }
+                let label = if protected {
+                    "protected"
+                } else {
+                    "deprotected"
+                };
+                self.command_line
+                    .log(format!("Protect: {} atoms {}.", total, label));
+            }
             "select" => {
-                // select <selection> — just counts matching atoms
+                if let Some((name, sel, merge)) = match Self::parse_select_args(args) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                } {
+                    let total = self.scene.define_named_selection(
+                        &name,
+                        &sel,
+                        self.scene.current_state,
+                        merge,
+                    );
+                    self.command_line.log(format!(
+                        "Selector: selection \"{}\" defined with {} atoms.",
+                        name, total
+                    ));
+                    return;
+                }
+
                 let sel = match parse_selection(args) {
                     Ok(s) => s,
                     Err(e) => {
@@ -892,7 +2017,14 @@ impl MolApp {
                         return;
                     }
                 };
-                let names = if include_objects {
+                let include_selections = match Self::get_names_includes_selections(&name_type) {
+                    Ok(include_selections) => include_selections,
+                    Err(e) => {
+                        self.command_line.log(e);
+                        return;
+                    }
+                };
+                let mut names = if include_objects {
                     self.scene.object_names(
                         enabled_only,
                         selection.as_ref(),
@@ -901,6 +2033,9 @@ impl MolApp {
                 } else {
                     Vec::new()
                 };
+                if include_selections {
+                    names.extend(self.scene.named_selection_names());
+                }
                 self.command_line.log(format!(
                     "cmd.get_names: {}",
                     Self::format_string_list(&names)
@@ -977,10 +2112,14 @@ impl MolApp {
                     result.distance
                 ));
             }
-            "get_angle" => {
+            "get_angle" | "angle" => {
                 let (sel1, sel2, sel3, state) = match Self::parse_three_selection_state_args(
                     args,
-                    "Usage: get_angle <sel1>, <sel2>, <sel3> [, state]",
+                    if verb == "get_angle" {
+                        "Usage: get_angle <sel1>, <sel2>, <sel3> [, state]"
+                    } else {
+                        "Usage: angle <sel1>, <sel2>, <sel3> [, state]"
+                    },
                 ) {
                     Ok(parsed) => parsed,
                     Err(e) => {
@@ -990,16 +2129,26 @@ impl MolApp {
                 };
                 let state = state.unwrap_or(self.scene.current_state);
                 match self.scene.selection_angle(&sel1, &sel2, &sel3, state) {
-                    Ok(angle) => self
-                        .command_line
-                        .log(format!("cmd.get_angle: {:.3} degrees.", angle)),
+                    Ok(angle) => {
+                        if verb == "get_angle" {
+                            self.command_line
+                                .log(format!("cmd.get_angle: {:.3} degrees.", angle));
+                        } else {
+                            self.command_line
+                                .log(format!("Angle: {:.2} degrees", angle));
+                        }
+                    }
                     Err(e) => self.command_line.log(Self::format_selection_point_error(e)),
                 }
             }
-            "get_dihedral" => {
+            "get_dihedral" | "dihedral" => {
                 let (sel1, sel2, sel3, sel4, state) = match Self::parse_four_selection_state_args(
                     args,
-                    "Usage: get_dihedral <sel1>, <sel2>, <sel3>, <sel4> [, state]",
+                    if verb == "get_dihedral" {
+                        "Usage: get_dihedral <sel1>, <sel2>, <sel3>, <sel4> [, state]"
+                    } else {
+                        "Usage: dihedral <sel1>, <sel2>, <sel3>, <sel4> [, state]"
+                    },
                 ) {
                     Ok(parsed) => parsed,
                     Err(e) => {
@@ -1012,9 +2161,15 @@ impl MolApp {
                     .scene
                     .selection_dihedral(&sel1, &sel2, &sel3, &sel4, state)
                 {
-                    Ok(angle) => self
-                        .command_line
-                        .log(format!("cmd.get_dihedral: {:.3} degrees.", angle)),
+                    Ok(angle) => {
+                        if verb == "get_dihedral" {
+                            self.command_line
+                                .log(format!("cmd.get_dihedral: {:.3} degrees.", angle));
+                        } else {
+                            self.command_line
+                                .log(format!("Dihedral: {:.2} degrees", angle));
+                        }
+                    }
                     Err(e) => self.command_line.log(Self::format_selection_point_error(e)),
                 }
             }
@@ -1109,9 +2264,12 @@ impl MolApp {
                     return;
                 }
 
-                let deleted = self.scene.delete_objects(args);
-                self.command_line
-                    .log(format!("delete {}: {} object(s)", args, deleted));
+                let deleted_objects = self.scene.delete_objects(args);
+                let deleted_selections = self.scene.delete_named_selections(args);
+                self.command_line.log(format!(
+                    "delete {}: {} object(s), {} selection(s)",
+                    args, deleted_objects, deleted_selections
+                ));
             }
             "sort" => {
                 let pattern = if args.is_empty() { "all" } else { args };
@@ -1289,6 +2447,9 @@ impl MolApp {
                 self.command_line
                     .log("  extract <name>, <sel>   — Move selection into new object");
                 self.command_line.log(
+                    "  split_states <obj>[, first [, last [, prefix]]] — Split states into objects",
+                );
+                self.command_line.log(
                     "  show <rep>[, <sel>]     — Show representation (wire/lines/sticks/spheres/cartoon/everything)",
                 );
                 self.command_line
@@ -1298,7 +2459,28 @@ impl MolApp {
                 self.command_line
                     .log("  color <color>[, <sel>]  — Color atoms");
                 self.command_line
-                    .log("  select <sel>            — Count matching atoms");
+                    .log("  label [sel [, expr]]    — Set or clear atom labels");
+                self.command_line
+                    .log("  alter <sel>, <field>=<value> — Edit simple atom fields");
+                self.command_line
+                    .log("  alter_state <state>, <sel>, <x|y|z>=<value> — Edit coordinates");
+                self.command_line
+                    .log("  iterate <sel>, <field> — Print simple atom field values");
+                self.command_line
+                    .log("  iterate_state <state>, <sel>, <field> — Print coordinate/atom fields");
+                self.command_line
+                    .log("  translate [x,y,z][, sel [, state]] — Translate coordinates");
+                self.command_line.log(
+                    "  rotate <axis>, <angle>[, sel [, state [, origin]]] — Rotate coordinates",
+                );
+                self.command_line
+                    .log("  flag <flag>, <sel>[, action] — Set/clear atom flags");
+                self.command_line
+                    .log("  mask|unmask [sel]       — Toggle atom masking");
+                self.command_line
+                    .log("  protect|deprotect [sel] — Toggle atom protection");
+                self.command_line
+                    .log("  select [name,] <sel>[, merge] — Count or store matching atoms");
                 self.command_line
                     .log("  count_atoms [sel]       — Count matching atoms");
                 self.command_line
@@ -1328,6 +2510,10 @@ impl MolApp {
                 self.command_line
                     .log("  get_dihedral <s1>, <s2>, <s3>, <s4> — Query torsion");
                 self.command_line
+                    .log("  angle <s1>, <s2>, <s3> — Compute atom angle");
+                self.command_line
+                    .log("  dihedral <s1>, <s2>, <s3>, <s4> — Compute torsion");
+                self.command_line
                     .log("  get_position          — Print viewer center");
                 self.command_line
                     .log("  get_clip              — Print clipping planes");
@@ -1338,7 +2524,7 @@ impl MolApp {
                 self.command_line
                     .log("  enable|disable [obj]    — Toggle object visibility");
                 self.command_line
-                    .log("  delete <obj|all>        — Delete matching objects");
+                    .log("  delete <obj|selection|all> — Delete matching objects/selections");
                 self.command_line
                     .log("  sort [obj]              — Sort atoms in molecule objects");
                 self.command_line
@@ -1360,7 +2546,7 @@ impl MolApp {
                 self.command_line
                     .log("  reset                   — Reset camera view");
                 self.command_line.log(
-                    "Selections: chain A+B, model/object obj*, rep wire/sticks/spheres/cartoon/everything, color red, resi 1-50 (resi/residue), resn/resname ALA, name/ca C*, bb/backbone, sidechain, elem/element/symbol C, alt A, ss H/S/L, serial/index/ID 5, b/q/x/y/z <value>, byres/byca/bychain/byobject/bymolecule chain A, first/last chain A, within/around/expand/beyond/near_to 5 chain A, extend 2 chain A, neighbor chain A, bonded, guide, het/hetatm, hydro/hydrogens, solvent, polymer/protein/nucleic, metals, organic, inorganic, visible/vis, present/pr., enabled, all/*, !/not, &/and, |/or, ()",
+                    "Selections: %stored, chain A+B, segi/segment SEG*, model/object obj*, rep wire/sticks/spheres/cartoon/everything, color red, resi 1-50 (resi/residue), resn/resname ALA, pepseq/ps. AG, name/ca C*, text_type/custom/label type*, numeric_type/nt. 42, stereo R/S/odd/even, bb/backbone, sidechain, elem/element/symbol C, alt A, ss H/S/L, id/ID/serial 5, index/idx. 5, rank 5, state 2, flag/f. 25, fixed/fxd., restrained/rst., masked/msk., protected, b/q/formal_charge/partial_charge/vdw/elec_radius/cartoon/geom/valence/reps/protons/flags/explicit_degree/explicit_valence/x/y/z <value>, p.score > 0.5, p.kind in ligand*, byres/byca/bychain/bysegment/byobject/bymolecule/byfragment chain A, first/last chain A, within/around/expand/beyond/near_to/gap 5 chain A, extend 2 chain A, neighbor/bound_to chain A, bonded, donors/hbd., acceptors/hba., delocalized, guide, het/hetatm, hydro/hydrogens, solvent, polymer/protein/nucleic, metals, organic, inorganic, visible/vis, present/pr., enabled, all/*, !/not, &/and, |/+/or, -/and-not, in, like/l., ()",
                 );
             }
             _ => {
@@ -1457,6 +2643,370 @@ mod tests {
         app.handle_command("show_as ribbon, name O");
         assert_eq!(app.scene.molecules[0].atoms[0].vis_rep, REP_STICKS);
         assert_eq!(app.scene.molecules[0].atoms[1].vis_rep, REP_CARTOON);
+    }
+
+    #[test]
+    fn flag_mask_and_protect_commands_update_atom_state() {
+        let mut app = test_app();
+
+        app.handle_command("flag ignore, name CA, set");
+        assert_eq!(app.scene.molecules[0].atoms[0].flags, 1 << 25);
+        assert_eq!(app.scene.molecules[0].atoms[1].flags, 0);
+
+        app.handle_command("flag 25, chain B, reset");
+        assert_eq!(app.scene.molecules[0].atoms[0].flags, 0);
+        assert_eq!(app.scene.molecules[0].atoms[1].flags, 1 << 25);
+
+        app.handle_command("flag ignore, all, clear");
+        assert_eq!(app.scene.molecules[0].atoms[0].flags, 0);
+        assert_eq!(app.scene.molecules[0].atoms[1].flags, 0);
+
+        app.handle_command("mask chain B");
+        assert!(!app.scene.molecules[0].atoms[0].masked);
+        assert!(app.scene.molecules[0].atoms[1].masked);
+
+        app.handle_command("unmask all");
+        assert!(!app.scene.molecules[0].atoms[0].masked);
+        assert!(!app.scene.molecules[0].atoms[1].masked);
+
+        app.handle_command("protect name CA");
+        assert!(app.scene.molecules[0].atoms[0].protected);
+        assert!(!app.scene.molecules[0].atoms[1].protected);
+
+        app.handle_command("deprotect all");
+        assert!(!app.scene.molecules[0].atoms[0].protected);
+        assert!(!app.scene.molecules[0].atoms[1].protected);
+    }
+
+    #[test]
+    fn label_command_updates_atom_labels() {
+        let mut app = test_app();
+
+        app.handle_command("label all, chain");
+        assert_eq!(app.scene.molecules[0].atoms[0].label, "A");
+        assert_eq!(app.scene.molecules[0].atoms[1].label, "B");
+
+        app.handle_command("label name CA, 'active site'");
+        assert_eq!(app.scene.molecules[0].atoms[0].label, "active site");
+        assert_eq!(app.scene.molecules[0].atoms[1].label, "B");
+
+        app.handle_command("label label active*");
+        assert_eq!(app.scene.molecules[0].atoms[0].label, "");
+        assert_eq!(app.scene.molecules[0].atoms[1].label, "B");
+    }
+
+    #[test]
+    fn alter_command_updates_simple_atom_fields() {
+        let mut app = test_app();
+
+        app.handle_command("alter name CA, chain='B'");
+        assert_eq!(app.scene.molecules[0].atoms[0].chain, 'B');
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "alter: 1 atoms (residues rebuilt)"
+        );
+
+        app.handle_command("alter name CA, resi=7");
+        assert_eq!(app.scene.molecules[0].atoms[0].resi, 7);
+        assert_eq!(app.scene.molecules[0].residues.len(), 2);
+
+        app.handle_command("alter name CA, b=42.5");
+        assert!((app.scene.molecules[0].atoms[0].b_factor - 42.5).abs() < f32::EPSILON);
+        assert_eq!(app.command_line.output.last().unwrap(), "alter: 1 atoms");
+
+        app.handle_command("alter name CA, label='active'");
+        assert_eq!(app.scene.molecules[0].atoms[0].label, "active");
+
+        app.handle_command("alter name CA, elem='N'");
+        assert_eq!(app.scene.molecules[0].atoms[0].elem_symbol, "N");
+        assert_eq!(app.scene.molecules[0].atoms[0].element, 7);
+
+        app.handle_command("alter name CA, masked=on");
+        assert!(app.scene.molecules[0].atoms[0].masked);
+
+        app.handle_command("alter name CA, cartoon_color=blue");
+        assert_eq!(
+            app.scene.molecules[0].atoms[0].cartoon_color,
+            Some([0.2, 0.2, 1.0])
+        );
+
+        app.handle_command("alter name CA, name='CB'");
+        assert_eq!(app.scene.molecules[0].atoms[0].name, "CB");
+        app.handle_command("select name CB");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 1 atoms");
+
+        app.handle_command("alter name CB, unknown=1");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Unsupported alter field: 'unknown'"
+        );
+    }
+
+    #[test]
+    fn iterate_command_reports_simple_atom_fields() {
+        let mut app = test_app();
+        app.scene.molecules[0].atoms[0].resi = 7;
+        app.scene.molecules[0].atoms[1].resi = 8;
+        app.scene.molecules[0].atoms[0].partial_charge = -0.25;
+        app.scene.molecules[0].atoms[1].partial_charge = 0.5;
+
+        app.handle_command("iterate all, name");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate: ['CA', 'O']"
+        );
+
+        app.handle_command("iterate chain B, print(resi)");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate: ['8']"
+        );
+
+        app.handle_command("iterate all, partial_charge");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate: ['-0.25', '0.5']"
+        );
+
+        app.scene.current_state = 1;
+        app.scene.molecules[0].coord_sets = vec![vec![[0.0, 0.0, 0.0]]];
+        app.handle_command("iterate all, name");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate: ['CA']"
+        );
+
+        app.handle_command("iterate all");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Usage: iterate <selection>, <field>"
+        );
+    }
+
+    #[test]
+    fn alter_state_command_updates_coordinates() {
+        let mut app = test_app();
+        app.scene.molecules[0].coord_sets = vec![
+            vec![[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+            vec![[6.0, 7.0, 8.0], [9.0, 10.0, 11.0]],
+        ];
+        app.scene.current_state = 2;
+
+        app.handle_command("alter_state 1, name CA, x=12.5");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "alter_state: 1 coordinates"
+        );
+        assert_eq!(app.scene.molecules[0].coord_sets[0][0], [12.5, 1.0, 2.0]);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][0], [6.0, 7.0, 8.0]);
+
+        app.handle_command("alter_state -1, chain B, z=-3");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "alter_state: 1 coordinates"
+        );
+        assert_eq!(app.scene.molecules[0].coord_sets[1][1], [9.0, 10.0, -3.0]);
+
+        app.handle_command("alter_state 0, all, y=2");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "alter_state: 4 coordinates"
+        );
+        assert_eq!(app.scene.molecules[0].coord_sets[0][0][1], 2.0);
+        assert_eq!(app.scene.molecules[0].coord_sets[0][1][1], 2.0);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][0][1], 2.0);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][1][1], 2.0);
+
+        app.handle_command("alter_state 1, all, b=2");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Usage: alter_state <state>, <selection>, <x|y|z>=<value>"
+        );
+    }
+
+    #[test]
+    fn iterate_state_command_reports_coordinates_and_fields() {
+        let mut app = test_app();
+        app.scene.molecules[0].coord_sets = vec![
+            vec![[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+            vec![[6.0, 7.0, 8.0], [9.0, 10.0, 11.0]],
+        ];
+        app.scene.current_state = 2;
+
+        app.handle_command("iterate_state 1, all, x");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate_state: ['0', '3']"
+        );
+
+        app.handle_command("iterate_state -1, chain B, print(z)");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate_state: ['11']"
+        );
+
+        app.handle_command("iterate_state 0, name CA, y");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate_state: ['1', '7']"
+        );
+
+        app.handle_command("iterate_state 2, all, name");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.iterate_state: ['CA', 'O']"
+        );
+
+        app.handle_command("iterate_state 1, all");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Usage: iterate_state <state>, <selection>, <field>"
+        );
+    }
+
+    #[test]
+    fn translate_command_offsets_selected_coordinates() {
+        let mut app = test_app();
+        app.scene.molecules[0].coord_sets = vec![
+            vec![[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]],
+            vec![[6.0, 7.0, 8.0], [9.0, 10.0, 11.0]],
+        ];
+        app.scene.current_state = 2;
+
+        app.handle_command("translate [1,0,-1], name CA, 1");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "translate: 1 coordinates"
+        );
+        assert_eq!(app.scene.molecules[0].coord_sets[0][0], [1.0, 1.0, 1.0]);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][0], [6.0, 7.0, 8.0]);
+
+        app.handle_command("translate [0,2,0], chain B");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "translate: 1 coordinates"
+        );
+        assert_eq!(app.scene.molecules[0].coord_sets[1][1], [9.0, 12.0, 11.0]);
+
+        app.handle_command("translate [1 1 1], all, 0");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "translate: 4 coordinates"
+        );
+        assert_eq!(app.scene.molecules[0].coord_sets[0][0], [2.0, 2.0, 2.0]);
+        assert_eq!(app.scene.molecules[0].coord_sets[0][1], [4.0, 5.0, 6.0]);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][0], [7.0, 8.0, 9.0]);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][1], [10.0, 13.0, 12.0]);
+
+        app.handle_command("translate [1,2], all");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Usage: translate [x,y,z] [, selection [, state]]"
+        );
+    }
+
+    #[test]
+    fn rotate_command_rotates_selected_coordinates() {
+        let mut app = test_app();
+        app.scene.molecules[0].coord_sets = vec![
+            vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        ];
+        app.scene.current_state = 2;
+
+        app.handle_command("rotate z, 90, name CA, 1");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "rotate: 1 coordinates"
+        );
+        let rotated = app.scene.molecules[0].coord_sets[0][0];
+        assert!(rotated[0].abs() < 1e-5);
+        assert!((rotated[1] - 1.0).abs() < 1e-5);
+        assert_eq!(app.scene.molecules[0].coord_sets[1][0], [0.0, 0.0, 1.0]);
+
+        app.handle_command("rotate x, 90, name CA");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "rotate: 1 coordinates"
+        );
+        let rotated_current = app.scene.molecules[0].coord_sets[1][0];
+        assert!((rotated_current[1] + 1.0).abs() < 1e-5);
+        assert!(rotated_current[2].abs() < 1e-5);
+
+        app.handle_command("rotate [0,0,1], 90, all, 0");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "rotate: 4 coordinates"
+        );
+
+        app.scene.molecules[0].coord_sets = vec![vec![[2.0, 0.0, 0.0], [1.0, 1.0, 0.0]]];
+        app.handle_command("rotate z, 90, all, 1, [1 0 0]");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "rotate: 2 coordinates"
+        );
+        let about_origin = app.scene.molecules[0].coord_sets[0][0];
+        assert!((about_origin[0] - 1.0).abs() < 1e-5);
+        assert!((about_origin[1] - 1.0).abs() < 1e-5);
+        let origin_anchor = app.scene.molecules[0].coord_sets[0][1];
+        assert!(origin_anchor[0].abs() < 1e-5);
+        assert!(origin_anchor[1].abs() < 1e-5);
+
+        app.handle_command("rotate q, 90, all");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Usage: rotate <x|y|z|[x,y,z]>, <angle> [, selection [, state [, origin]]]"
+        );
+    }
+
+    #[test]
+    fn select_command_defines_named_selection() {
+        let mut app = test_app();
+
+        app.handle_command("select stored, name CA");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Selector: selection \"stored\" defined with 1 atoms."
+        );
+
+        app.handle_command("select %stored");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 1 atoms");
+
+        app.handle_command("select stored");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 1 atoms");
+
+        app.handle_command("select obj");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 2 atoms");
+
+        app.handle_command("get_names selections");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.get_names: ['stored']"
+        );
+
+        app.handle_command("select stored, chain B");
+        app.handle_command("select %stored");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 1 atoms");
+        assert!(app.scene.molecules[0].atoms[0]
+            .properties
+            .keys()
+            .all(|key| !key.ends_with("stored")));
+
+        app.handle_command("select stored, name CA, merge");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Selector: selection \"stored\" defined with 2 atoms."
+        );
+        app.handle_command("select stored");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 2 atoms");
+
+        app.handle_command("delete stored");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "delete stored: 0 object(s), 1 selection(s)"
+        );
+        app.handle_command("select %stored");
+        assert_eq!(app.command_line.output.last().unwrap(), "Selected 0 atoms");
     }
 
     #[test]
@@ -1701,6 +3251,47 @@ mod tests {
     }
 
     #[test]
+    fn split_states_command_creates_single_state_objects() {
+        let mut app = test_app();
+        app.scene.molecules[0].name = "traj".to_string();
+        app.scene.molecules[0].bonds = vec![BondInfo {
+            atom_a: 0,
+            atom_b: 1,
+            order: 1,
+        }];
+        app.scene.molecules[0].coord_sets = vec![
+            vec![[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
+            vec![[1.0, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            vec![[2.0, 0.0, 0.0], [2.5, 0.0, 0.0]],
+        ];
+        app.scene.molecules[0].build_residues();
+
+        app.handle_command("split_states traj");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "split_states traj: 3 object(s)"
+        );
+        assert_eq!(app.scene.molecules.len(), 4);
+        assert_eq!(app.scene.molecules[1].name, "traj_0001");
+        assert_eq!(app.scene.molecules[2].name, "traj_0002");
+        assert_eq!(app.scene.molecules[3].name, "traj_0003");
+        assert_eq!(app.scene.molecules[1].coord_sets.len(), 1);
+        assert_eq!(app.scene.molecules[2].coord_sets[0][0], [1.0, 0.0, 0.0]);
+        assert_eq!(app.scene.molecules[3].bonds.len(), 1);
+        assert_eq!(app.scene.molecules[3].residues.len(), 2);
+
+        app.handle_command("split_states traj, 2, 3, prefix=hit");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "split_states traj, 2, 3, prefix=hit: 2 object(s)"
+        );
+        assert_eq!(app.scene.molecules[4].name, "hit0002");
+        assert_eq!(app.scene.molecules[5].name, "hit0003");
+        assert_eq!(app.scene.molecules[4].coord_sets[0][0], [1.0, 0.0, 0.0]);
+        assert_eq!(app.scene.molecules[5].coord_sets[0][0], [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn set_name_renames_molecule_objects() {
         let mut app = test_app();
         app.scene.molecules[0].name = "source".to_string();
@@ -1879,11 +3470,18 @@ mod tests {
     fn get_type_reports_molecule_object_type() {
         let mut app = test_app();
         app.scene.molecules[0].name = "mol1".to_string();
+        app.handle_command("select sele1, name CA");
 
         app.handle_command("get_type mol1");
         assert_eq!(
             app.command_line.output.last().unwrap(),
             "cmd.get_type: object:molecule"
+        );
+
+        app.handle_command("get_type sele1");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.get_type: object:selection"
         );
 
         app.handle_command("get_type missing");
@@ -1904,11 +3502,18 @@ mod tests {
         let mut app = test_app();
         app.scene.molecules[0].name = "mol1".to_string();
         app.scene.molecules.push(Molecule::new("mol2".to_string()));
+        app.handle_command("select sele1, name CA");
 
         app.handle_command("get_names_of_type object:molecule");
         assert_eq!(
             app.command_line.output.last().unwrap(),
             "cmd.get_names_of_type: ['mol1', 'mol2']"
+        );
+
+        app.handle_command("get_names_of_type object:selection");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "cmd.get_names_of_type: ['sele1']"
         );
 
         app.handle_command("get_names_of_type object:map");
@@ -1985,6 +3590,13 @@ mod tests {
             "cmd.get_angle: 90.000 degrees."
         );
 
+        app.handle_command("angle name CA, name O, name N, 1");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Angle: 90.00 degrees"
+        );
+        assert!(app.scene.measurements.is_empty());
+
         app.handle_command("get_angle all, name O, name N");
         assert_eq!(
             app.command_line.output.last().unwrap(),
@@ -2040,6 +3652,13 @@ mod tests {
             app.command_line.output.last().unwrap(),
             "cmd.get_dihedral: -90.000 degrees."
         );
+
+        app.handle_command("dihedral name CA, name O, name N, name CB, 1");
+        assert_eq!(
+            app.command_line.output.last().unwrap(),
+            "Dihedral: -90.00 degrees"
+        );
+        assert!(app.scene.measurements.is_empty());
 
         app.handle_command("get_dihedral all, name O, name N, name CB");
         assert_eq!(

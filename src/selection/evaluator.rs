@@ -1,9 +1,11 @@
-use crate::core::atom::{REP_ALL, REP_CARTOON, REP_LINES, REP_SPHERES, REP_STICKS};
+use crate::core::atom::{
+    NAMED_SELECTION_PROPERTY_PREFIX, REP_ALL, REP_CARTOON, REP_LINES, REP_SPHERES, REP_STICKS,
+};
 use crate::core::element::{element_by_number, is_metal_atomic_number};
 use crate::core::molecule::Molecule;
-use crate::core::residue::{is_nucleic, is_protein, is_solvent};
+use crate::core::residue::{is_nucleic, is_protein, is_solvent, protein_one_letter};
 use crate::core::secondary_structure::SSType;
-use crate::selection::parser::{AtomProperty, CompareOp, Selector};
+use crate::selection::parser::{AtomProperty, CompareOp, CustomPropertyOp, Selector};
 
 /// Evaluate a selection expression against a molecule.
 /// Returns a Vec<bool> with one entry per atom — true means selected.
@@ -30,23 +32,56 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
             .iter()
             .map(|a| mol.visible && a.vis_rep != 0)
             .collect(),
+        Selector::Named(name) => {
+            let key = named_selection_property_key(name);
+            mol.atoms
+                .iter()
+                .map(|atom| atom.properties.contains_key(&key))
+                .collect()
+        }
+        Selector::Identifier(name) => {
+            let key = named_selection_property_key(name);
+            let object_selected = object_name_matches(name, &mol.name);
+            mol.atoms
+                .iter()
+                .map(|atom| object_selected || atom.properties.contains_key(&key))
+                .collect()
+        }
         Selector::Present => (0..n).map(|idx| idx < coords.len()).collect(),
+        Selector::State(state) => state_mask(*state, n, mol, coords),
         Selector::Bonded => bonded_atom_mask(mol),
+        Selector::Donors => (0..n).map(|idx| is_hbond_donor(idx, mol)).collect(),
+        Selector::Acceptors => (0..n).map(|idx| is_hbond_acceptor(idx, mol)).collect(),
+        Selector::Delocalized => (0..n).map(|idx| is_delocalized(idx, mol)).collect(),
+        Selector::Flag(flag) => {
+            let mask = 1u32 << *flag;
+            mol.atoms
+                .iter()
+                .map(|atom| atom.flags & mask != 0)
+                .collect()
+        }
+        Selector::Masked => mol.atoms.iter().map(|atom| atom.masked).collect(),
+        Selector::Protected => mol.atoms.iter().map(|atom| atom.protected).collect(),
         Selector::Chain(ch) => mol.atoms.iter().map(|a| a.chain == *ch).collect(),
         Selector::ChainPattern(pattern) => mol
             .atoms
             .iter()
             .map(|a| matches_alpha_list(&a.chain.to_string(), pattern))
             .collect(),
-        Selector::Resi(lo, hi) => mol
+        Selector::Segi(pattern) => mol
             .atoms
             .iter()
-            .map(|a| a.resi >= *lo && a.resi <= *hi)
+            .map(|a| matches_alpha_list(a.segi.trim(), pattern))
+            .collect(),
+        Selector::Resi(lo, hi, ins_lo, ins_hi) => mol
+            .atoms
+            .iter()
+            .map(|a| matches_resi_range(a.resi, a.ins_code, *lo, *hi, *ins_lo, *ins_hi))
             .collect(),
         Selector::ResiList(ranges) => mol
             .atoms
             .iter()
-            .map(|a| in_numeric_ranges(a.resi, ranges))
+            .map(|a| in_resi_ranges(a.resi, a.ins_code, ranges))
             .collect(),
         Selector::Name(name) => mol
             .atoms
@@ -58,22 +93,81 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
             .iter()
             .map(|a| matches_alpha_list(a.resn.trim(), resn))
             .collect(),
+        Selector::Pepseq(pattern) => pepseq_mask(pattern, mol),
+        Selector::TextType(text_type) => mol
+            .atoms
+            .iter()
+            .map(|a| matches_alpha_list(a.text_type.trim(), text_type))
+            .collect(),
+        Selector::NumericType(ranges) => mol
+            .atoms
+            .iter()
+            .map(|a| in_numeric_ranges(a.numeric_type, ranges))
+            .collect(),
+        Selector::Custom(custom) => mol
+            .atoms
+            .iter()
+            .map(|a| matches_alpha_list(a.custom.trim(), custom))
+            .collect(),
+        Selector::Label(label) => mol
+            .atoms
+            .iter()
+            .map(|a| matches_alpha_list(a.label.trim(), label))
+            .collect(),
+        Selector::Stereo(stereo) => mol
+            .atoms
+            .iter()
+            .map(|a| matches_alpha_list(a.stereo.trim(), stereo))
+            .collect(),
         Selector::Organic => mol.atoms.iter().map(|a| !a.is_hetatm).collect(),
         Selector::Inorganic => mol.atoms.iter().map(|a| a.is_hetatm).collect(),
         Selector::Serial(lo, hi) => mol
             .atoms
             .iter()
-            .map(|a| {
-                let serial = i32::try_from(a.serial).unwrap_or(0);
-                serial >= *lo && serial <= *hi
+            .enumerate()
+            .map(|(idx, a)| {
+                let id = atom_id(a, idx);
+                id >= *lo && id <= *hi
             })
             .collect(),
         Selector::SerialList(ranges) => mol
             .atoms
             .iter()
+            .enumerate()
+            .map(|(idx, a)| in_numeric_ranges(atom_id(a, idx), ranges))
+            .collect(),
+        Selector::Index(lo, hi) => mol
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let index = i32::try_from(idx + 1).unwrap_or(0);
+                index >= *lo && index <= *hi
+            })
+            .collect(),
+        Selector::IndexList(ranges) => mol
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let index = i32::try_from(idx + 1).unwrap_or(0);
+                in_numeric_ranges(index, ranges)
+            })
+            .collect(),
+        Selector::Rank(lo, hi) => mol
+            .atoms
+            .iter()
             .map(|a| {
-                let serial = i32::try_from(a.serial).unwrap_or(0);
-                in_numeric_ranges(serial, ranges)
+                let rank = i32::try_from(a.rank).unwrap_or(0);
+                rank >= *lo && rank <= *hi
+            })
+            .collect(),
+        Selector::RankList(ranges) => mol
+            .atoms
+            .iter()
+            .map(|a| {
+                let rank = i32::try_from(a.rank).unwrap_or(0);
+                in_numeric_ranges(rank, ranges)
             })
             .collect(),
         Selector::Model(pattern) => {
@@ -94,23 +188,56 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
                 .map(|atom| rgb.is_some_and(|rgb| colors_match(atom.color, rgb)))
                 .collect()
         }
+        Selector::CartoonColor(color) => {
+            let rgb = color_rgb(color);
+            mol.atoms
+                .iter()
+                .map(|atom| {
+                    rgb.is_some_and(|rgb| {
+                        atom.cartoon_color
+                            .is_some_and(|cartoon_color| colors_match(cartoon_color, rgb))
+                    })
+                })
+                .collect()
+        }
+        Selector::RibbonColor(color) => {
+            let rgb = color_rgb(color);
+            mol.atoms
+                .iter()
+                .map(|atom| {
+                    rgb.is_some_and(|rgb| {
+                        atom.ribbon_color
+                            .is_some_and(|ribbon_color| colors_match(ribbon_color, rgb))
+                    })
+                })
+                .collect()
+        }
         Selector::Property(property, op, value) => mol
             .atoms
             .iter()
             .enumerate()
             .map(|(idx, atom)| {
-                property_value(*property, atom, idx, coords)
+                property_value(*property, atom, idx, mol, coords)
                     .is_some_and(|atom_value| compare_float(atom_value, *op, *value))
+            })
+            .collect(),
+        Selector::CustomProperty(property, op, value) => mol
+            .atoms
+            .iter()
+            .map(|atom| {
+                atom.properties
+                    .get(property)
+                    .is_some_and(|atom_value| custom_property_matches(atom_value, *op, value))
             })
             .collect(),
         Selector::Byres(inner) => {
             let inner_mask = evaluate_with_coords(inner, mol, coords);
-            let mut residues: Vec<(char, i32, char)> = Vec::new();
+            let mut residues: Vec<(&str, char, i32, char)> = Vec::new();
 
             for (idx, selected) in inner_mask.iter().enumerate() {
                 if *selected {
                     if let Some(atom) = mol.atoms.get(idx) {
-                        let key = (atom.chain, atom.resi, atom.ins_code);
+                        let key = (atom.segi.as_str(), atom.chain, atom.resi, atom.ins_code);
                         if !residues.contains(&key) {
                             residues.push(key);
                         }
@@ -120,7 +247,9 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
 
             mol.atoms
                 .iter()
-                .map(|atom| residues.contains(&(atom.chain, atom.resi, atom.ins_code)))
+                .map(|atom| {
+                    residues.contains(&(atom.segi.as_str(), atom.chain, atom.resi, atom.ins_code))
+                })
                 .collect()
         }
         Selector::Bychain(inner) => {
@@ -142,6 +271,26 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
                 .map(|atom| chains.contains(&atom.chain))
                 .collect()
         }
+        Selector::Bysegment(inner) => {
+            let inner_mask = evaluate_with_coords(inner, mol, coords);
+            let mut segments: Vec<&str> = Vec::new();
+
+            for (idx, selected) in inner_mask.iter().enumerate() {
+                if *selected {
+                    if let Some(atom) = mol.atoms.get(idx) {
+                        let segi = atom.segi.as_str();
+                        if !segments.contains(&segi) {
+                            segments.push(segi);
+                        }
+                    }
+                }
+            }
+
+            mol.atoms
+                .iter()
+                .map(|atom| segments.contains(&atom.segi.as_str()))
+                .collect()
+        }
         Selector::Byobject(inner) => {
             let inner_mask = evaluate_with_coords(inner, mol, coords);
             vec![inner_mask.iter().any(|selected| *selected); n]
@@ -149,6 +298,10 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
         Selector::Bymolecule(inner) => {
             let inner_mask = evaluate_with_coords(inner, mol, coords);
             bonded_component_mask(&inner_mask, mol)
+        }
+        Selector::Byring(inner) => {
+            let inner_mask = evaluate_with_coords(inner, mol, coords);
+            ring_mask(&inner_mask, mol)
         }
         Selector::First(inner) => {
             let inner_mask = evaluate_with_coords(inner, mol, coords);
@@ -185,6 +338,25 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
 
             out
         }
+        Selector::BoundTo(inner) => {
+            let inner_mask = evaluate_with_coords(inner, mol, coords);
+            let mut out = vec![false; n];
+
+            if inner_mask.iter().any(|&x| x) {
+                for bond in &mol.bonds {
+                    if bond.atom_a < n && bond.atom_b < n {
+                        if inner_mask[bond.atom_a] {
+                            out[bond.atom_b] = true;
+                        }
+                        if inner_mask[bond.atom_b] {
+                            out[bond.atom_a] = true;
+                        }
+                    }
+                }
+            }
+
+            out
+        }
         Selector::Around(distance, inner) => {
             let inner_mask = evaluate_with_coords(inner, mol, coords);
             distance_mask(*distance, inner, mol, coords)
@@ -212,6 +384,7 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
                 .map(|(idx, selected)| selected && !inner_mask.get(idx).copied().unwrap_or(false))
                 .collect()
         }
+        Selector::Gap(distance, inner) => gap_mask(*distance, inner, mol, coords),
         Selector::Elem(sym) => mol
             .atoms
             .iter()
@@ -232,15 +405,7 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
             .map(|a| matches_secondary_structure(a.ss_type, ss))
             .collect(),
         Selector::Hetatm => mol.atoms.iter().map(|a| a.is_hetatm).collect(),
-        Selector::Hydrogen => mol
-            .atoms
-            .iter()
-            .map(|a| {
-                a.element == 1
-                    || a.elem_symbol.eq_ignore_ascii_case("H")
-                    || a.name.trim_start_matches(char::is_numeric).starts_with('H')
-            })
-            .collect(),
+        Selector::Hydrogen => mol.atoms.iter().map(is_hydrogen_atom).collect(),
         Selector::Solvent => mol.atoms.iter().map(|a| is_solvent(&a.resn)).collect(),
         Selector::Polymer => mol
             .atoms
@@ -269,6 +434,16 @@ pub fn evaluate_with_coords(sel: &Selector, mol: &Molecule, coords: &[[f32; 3]])
             let v = evaluate_with_coords(inner, mol, coords);
             v.iter().map(|x| !x).collect()
         }
+        Selector::In(left, right) => {
+            let left_mask = evaluate_with_coords(left, mol, coords);
+            let right_mask = evaluate_with_coords(right, mol, coords);
+            atom_identity_mask(&left_mask, &right_mask, mol, atom_in_matches)
+        }
+        Selector::Like(left, right) => {
+            let left_mask = evaluate_with_coords(left, mol, coords);
+            let right_mask = evaluate_with_coords(right, mol, coords);
+            atom_identity_mask(&left_mask, &right_mask, mol, atom_like_matches)
+        }
     }
 }
 
@@ -280,12 +455,262 @@ pub fn count_selected(mask: &[bool]) -> usize {
 fn matches_alpha_list(value: &str, pattern: &str) -> bool {
     pattern.split(['+', ',']).any(|item| {
         let item = item.trim();
-        !item.is_empty() && wildcard_match_ci(item, value)
+        !item.is_empty()
+            && (if item.contains(':') {
+                matches_alpha_range_ci(item, value)
+            } else {
+                wildcard_match_ci(item, value)
+            })
     })
+}
+
+fn matches_alpha_range_ci(range: &str, value: &str) -> bool {
+    let mut parts = range.split(':');
+    let low = parts.next();
+    let high = parts.next();
+    if low.is_none() || high.is_none() || parts.next().is_some() {
+        return false;
+    }
+
+    let low = low.unwrap_or("");
+    let high = high.unwrap_or("");
+    if low.is_empty()
+        || high.is_empty()
+        || low.contains('*')
+        || high.contains('*')
+        || low.contains('+')
+        || high.contains('+')
+    {
+        return false;
+    }
+
+    let value = value.to_ascii_lowercase();
+    let low = low.to_ascii_lowercase();
+    let high = high.to_ascii_lowercase();
+    low <= value && value <= high
+}
+
+pub fn named_selection_property_key(name: &str) -> String {
+    format!("{}{}", NAMED_SELECTION_PROPERTY_PREFIX, name)
+}
+
+fn atom_identity_mask(
+    left_mask: &[bool],
+    right_mask: &[bool],
+    mol: &Molecule,
+    matches: fn(&crate::core::atom::AtomInfo, &crate::core::atom::AtomInfo) -> bool,
+) -> Vec<bool> {
+    let right_atoms: Vec<&crate::core::atom::AtomInfo> = mol
+        .atoms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, atom)| {
+            right_mask
+                .get(idx)
+                .copied()
+                .unwrap_or(false)
+                .then_some(atom)
+        })
+        .collect();
+
+    mol.atoms
+        .iter()
+        .enumerate()
+        .map(|(idx, atom)| {
+            left_mask.get(idx).copied().unwrap_or(false)
+                && right_atoms
+                    .iter()
+                    .any(|right_atom| matches(atom, right_atom))
+        })
+        .collect()
+}
+
+fn atom_in_matches(
+    left: &crate::core::atom::AtomInfo,
+    right: &crate::core::atom::AtomInfo,
+) -> bool {
+    left.resi == right.resi
+        && left.chain.eq_ignore_ascii_case(&right.chain)
+        && left.name.eq_ignore_ascii_case(&right.name)
+        && left.ins_code.eq_ignore_ascii_case(&right.ins_code)
+        && left.resn.eq_ignore_ascii_case(&right.resn)
+        && left.segi.eq_ignore_ascii_case(&right.segi)
+}
+
+fn atom_like_matches(
+    left: &crate::core::atom::AtomInfo,
+    right: &crate::core::atom::AtomInfo,
+) -> bool {
+    left.resi == right.resi
+        && left.name.eq_ignore_ascii_case(&right.name)
+        && left.ins_code.eq_ignore_ascii_case(&right.ins_code)
+}
+
+#[derive(Debug, Clone)]
+struct ResidueSpan {
+    resn: String,
+    start: usize,
+    end: usize,
+}
+
+fn pepseq_mask(pattern: &str, mol: &Molecule) -> Vec<bool> {
+    let n = mol.atoms.len();
+    let pattern: Vec<char> = pattern
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect();
+
+    if pattern.is_empty() {
+        return vec![false; n];
+    }
+
+    let residues = residue_spans(mol);
+    let mut out = vec![false; n];
+    if residues.len() < pattern.len() {
+        return out;
+    }
+
+    for start in 0..=residues.len() - pattern.len() {
+        if !pepseq_matches_at(&residues, &pattern, start) {
+            continue;
+        }
+
+        for (offset, pattern_char) in pattern.iter().enumerate() {
+            if *pattern_char == '-' {
+                continue;
+            }
+            let residue = &residues[start + offset];
+            for idx in residue.start..residue.end.min(n) {
+                out[idx] = true;
+            }
+        }
+    }
+
+    out
+}
+
+fn pepseq_matches_at(residues: &[ResidueSpan], pattern: &[char], start: usize) -> bool {
+    pattern.iter().enumerate().all(|(offset, pattern_char)| {
+        if *pattern_char == '-' || *pattern_char == '+' {
+            return true;
+        }
+        protein_one_letter(&residues[start + offset].resn)
+            .is_some_and(|residue_char| residue_char == *pattern_char)
+    })
+}
+
+fn residue_spans(mol: &Molecule) -> Vec<ResidueSpan> {
+    let mut residues = Vec::new();
+    if mol.atoms.is_empty() {
+        return residues;
+    }
+
+    let mut start = 0usize;
+    for idx in 1..=mol.atoms.len() {
+        let new_residue = if idx == mol.atoms.len() {
+            true
+        } else {
+            let previous = &mol.atoms[idx - 1];
+            let current = &mol.atoms[idx];
+            previous.segi != current.segi
+                || previous.chain != current.chain
+                || previous.resi != current.resi
+                || previous.ins_code != current.ins_code
+                || previous.resn != current.resn
+        };
+
+        if new_residue {
+            residues.push(ResidueSpan {
+                resn: mol.atoms[start].resn.clone(),
+                start,
+                end: idx,
+            });
+            start = idx;
+        }
+    }
+
+    residues
 }
 
 fn in_numeric_ranges(value: i32, ranges: &[(i32, i32)]) -> bool {
     ranges.iter().any(|(lo, hi)| value >= *lo && value <= *hi)
+}
+
+fn state_mask(state: isize, atom_count: usize, mol: &Molecule, coords: &[[f32; 3]]) -> Vec<bool> {
+    let state_coords = if state == -1 {
+        Some(coords)
+    } else if state >= 1 {
+        mol.coord_sets
+            .get((state - 1) as usize)
+            .map(|state_coords| state_coords.as_slice())
+    } else {
+        None
+    };
+
+    (0..atom_count)
+        .map(|idx| state_coords.is_some_and(|state_coords| idx < state_coords.len()))
+        .collect()
+}
+
+fn atom_id(atom: &crate::core::atom::AtomInfo, idx: usize) -> i32 {
+    let id = if atom.serial == 0 {
+        u32::try_from(idx + 1).unwrap_or(0)
+    } else {
+        atom.serial
+    };
+    i32::try_from(id).unwrap_or(0)
+}
+
+fn in_resi_ranges(
+    value: i32,
+    ins_code: char,
+    ranges: &[(i32, i32, Option<char>, Option<char>)],
+) -> bool {
+    ranges.iter().any(|(lo, hi, ins_lo, ins_hi)| {
+        matches_resi_range(value, ins_code, *lo, *hi, *ins_lo, *ins_hi)
+    })
+}
+
+fn matches_resi_range(
+    value: i32,
+    ins_code: char,
+    lo: i32,
+    hi: i32,
+    ins_lo: Option<char>,
+    ins_hi: Option<char>,
+) -> bool {
+    if value < lo || value > hi {
+        return false;
+    }
+
+    if lo == hi {
+        return match (ins_lo, ins_hi) {
+            (None, None) => true,
+            (Some(start), Some(end)) => ins_code >= start && ins_code <= end,
+            (Some(start), None) => ins_code >= start,
+            (None, Some(end)) => ins_code <= end,
+        };
+    }
+
+    if value == lo {
+        if let Some(start) = ins_lo {
+            if ins_code < start {
+                return false;
+            }
+        }
+    }
+
+    if value == hi {
+        if let Some(end) = ins_hi {
+            if ins_code > end {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 fn object_name_matches(pattern: &str, name: &str) -> bool {
@@ -335,14 +760,53 @@ fn property_value(
     property: AtomProperty,
     atom: &crate::core::atom::AtomInfo,
     idx: usize,
+    mol: &Molecule,
     coords: &[[f32; 3]],
 ) -> Option<f32> {
     match property {
         AtomProperty::BFactor => Some(atom.b_factor),
         AtomProperty::Occupancy => Some(atom.occupancy),
+        AtomProperty::FormalCharge => Some(atom.formal_charge as f32),
+        AtomProperty::PartialCharge => Some(atom.partial_charge),
+        AtomProperty::Vdw => Some(atom.vdw),
+        AtomProperty::ElecRadius => Some(atom.elec_radius),
+        AtomProperty::Cartoon => Some(atom.cartoon as f32),
+        AtomProperty::Geom => Some(atom.geom as f32),
+        AtomProperty::Valence => Some(atom.valence as f32),
+        AtomProperty::Reps => Some(atom.vis_rep as f32),
+        AtomProperty::Protons => Some(atom.element as f32),
+        AtomProperty::Flags => Some(atom.flags as f32),
+        AtomProperty::ExplicitDegree => Some(explicit_degree(idx, mol)),
+        AtomProperty::ExplicitValence => Some(explicit_valence(idx, mol)),
         AtomProperty::X => coords.get(idx).map(|coord| coord[0]),
         AtomProperty::Y => coords.get(idx).map(|coord| coord[1]),
         AtomProperty::Z => coords.get(idx).map(|coord| coord[2]),
+    }
+}
+
+fn custom_property_matches(atom_value: &str, op: CustomPropertyOp, selector_value: &str) -> bool {
+    match op {
+        CustomPropertyOp::In => matches_alpha_list(atom_value.trim(), selector_value),
+        CustomPropertyOp::Greater
+        | CustomPropertyOp::Less
+        | CustomPropertyOp::Equal
+        | CustomPropertyOp::GreaterEqual
+        | CustomPropertyOp::LessEqual => {
+            let Some(left) = atom_value.trim().parse::<f32>().ok() else {
+                return false;
+            };
+            let Some(right) = selector_value.parse::<f32>().ok() else {
+                return false;
+            };
+            match op {
+                CustomPropertyOp::Greater => left > right,
+                CustomPropertyOp::Less => left < right,
+                CustomPropertyOp::Equal => (left - right).abs() < 0.0001,
+                CustomPropertyOp::GreaterEqual => left >= right,
+                CustomPropertyOp::LessEqual => left <= right,
+                CustomPropertyOp::In => false,
+            }
+        }
     }
 }
 
@@ -444,6 +908,38 @@ fn distance_mask(
         .collect()
 }
 
+fn gap_mask(distance: f32, inner: &Selector, mol: &Molecule, coords: &[[f32; 3]]) -> Vec<bool> {
+    let n = mol.atoms.len();
+    let inner_mask = evaluate_with_coords(inner, mol, coords);
+    let clearance = distance.max(0.0);
+    let mut centers: Vec<(usize, [f32; 3], f32)> = Vec::new();
+
+    for (idx, selected) in inner_mask.iter().enumerate() {
+        if *selected && idx < coords.len() {
+            let vdw = mol.atoms.get(idx).map_or(0.0, |atom| atom.vdw);
+            centers.push((idx, coords[idx], vdw));
+        }
+    }
+
+    (0..n)
+        .map(|idx| {
+            if idx >= coords.len() || inner_mask.get(idx).copied().unwrap_or(false) {
+                return false;
+            }
+
+            let atom_vdw = mol.atoms.get(idx).map_or(0.0, |atom| atom.vdw);
+            let p = coords[idx];
+            !centers.iter().any(|(_, center, center_vdw)| {
+                let threshold = clearance + atom_vdw + center_vdw;
+                let dx = p[0] - center[0];
+                let dy = p[1] - center[1];
+                let dz = p[2] - center[2];
+                dx * dx + dy * dy + dz * dz <= threshold * threshold
+            })
+        })
+        .collect()
+}
+
 fn bonded_atom_mask(mol: &Molecule) -> Vec<bool> {
     let mut out = vec![false; mol.atoms.len()];
 
@@ -457,6 +953,78 @@ fn bonded_atom_mask(mol: &Molecule) -> Vec<bool> {
     }
 
     out
+}
+
+fn is_hydrogen_atom(atom: &crate::core::atom::AtomInfo) -> bool {
+    atom.element == 1
+        || atom.elem_symbol.eq_ignore_ascii_case("H")
+        || atom
+            .name
+            .trim_start_matches(char::is_numeric)
+            .starts_with('H')
+}
+
+fn is_hbond_donor(idx: usize, mol: &Molecule) -> bool {
+    let Some(atom) = mol.atoms.get(idx) else {
+        return false;
+    };
+    matches!(atom.element, 7 | 8 | 16) && has_bonded_hydrogen(idx, mol)
+}
+
+fn is_hbond_acceptor(idx: usize, mol: &Molecule) -> bool {
+    let Some(atom) = mol.atoms.get(idx) else {
+        return false;
+    };
+
+    if atom.formal_charge > 0 || is_hydrogen_atom(atom) {
+        return false;
+    }
+
+    match atom.element {
+        8 | 16 => true,
+        7 => !has_bonded_hydrogen(idx, mol),
+        _ => false,
+    }
+}
+
+fn has_bonded_hydrogen(idx: usize, mol: &Molecule) -> bool {
+    mol.bonds.iter().filter(|bond| bond.order > 0).any(|bond| {
+        let other = if bond.atom_a == idx {
+            Some(bond.atom_b)
+        } else if bond.atom_b == idx {
+            Some(bond.atom_a)
+        } else {
+            None
+        };
+
+        other
+            .and_then(|other| mol.atoms.get(other))
+            .is_some_and(is_hydrogen_atom)
+    })
+}
+
+fn explicit_degree(idx: usize, mol: &Molecule) -> f32 {
+    mol.bonds
+        .iter()
+        .filter(|bond| bond.order > 0 && (bond.atom_a == idx || bond.atom_b == idx))
+        .count() as f32
+}
+
+fn explicit_valence(idx: usize, mol: &Molecule) -> f32 {
+    mol.bonds
+        .iter()
+        .filter(|bond| bond.order > 0 && (bond.atom_a == idx || bond.atom_b == idx))
+        .map(|bond| match bond.order {
+            4 => 1.5,
+            order => order as f32,
+        })
+        .sum()
+}
+
+fn is_delocalized(idx: usize, mol: &Molecule) -> bool {
+    mol.bonds
+        .iter()
+        .any(|bond| bond.order == 4 && (bond.atom_a == idx || bond.atom_b == idx))
 }
 
 fn bonded_component_mask(inner_mask: &[bool], mol: &Molecule) -> Vec<bool> {
@@ -492,6 +1060,75 @@ fn bonded_component_mask(inner_mask: &[bool], mol: &Molecule) -> Vec<bool> {
     }
 
     out
+}
+
+fn ring_mask(inner_mask: &[bool], mol: &Molecule) -> Vec<bool> {
+    const MAX_RING_SIZE: usize = 7;
+
+    let n = mol.atoms.len();
+    let adjacency = bond_adjacency(mol);
+    let mut out = vec![false; n];
+
+    for start in inner_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, selected)| (*selected && idx < n).then_some(idx))
+    {
+        let mut visited = vec![false; n];
+        let mut path = vec![start];
+        visited[start] = true;
+        collect_rings_from(
+            start,
+            start,
+            &adjacency,
+            &mut visited,
+            &mut path,
+            &mut out,
+            MAX_RING_SIZE,
+        );
+    }
+
+    out
+}
+
+fn collect_rings_from(
+    start: usize,
+    current: usize,
+    adjacency: &[Vec<usize>],
+    visited: &mut [bool],
+    path: &mut Vec<usize>,
+    out: &mut [bool],
+    max_ring_size: usize,
+) {
+    for &next in &adjacency[current] {
+        if next == start {
+            if path.len() >= 3 {
+                for &idx in path.iter() {
+                    out[idx] = true;
+                }
+            }
+        } else if path.len() < max_ring_size && !visited[next] {
+            visited[next] = true;
+            path.push(next);
+            collect_rings_from(start, next, adjacency, visited, path, out, max_ring_size);
+            path.pop();
+            visited[next] = false;
+        }
+    }
+}
+
+fn bond_adjacency(mol: &Molecule) -> Vec<Vec<usize>> {
+    let n = mol.atoms.len();
+    let mut adjacency = vec![Vec::new(); n];
+
+    for bond in mol.bonds.iter().filter(|bond| bond.order > 0) {
+        if bond.atom_a < n && bond.atom_b < n {
+            adjacency[bond.atom_a].push(bond.atom_b);
+            adjacency[bond.atom_b].push(bond.atom_a);
+        }
+    }
+
+    adjacency
 }
 
 fn extend_bond_mask(inner_mask: &[bool], mol: &Molecule, count: usize) -> Vec<bool> {
@@ -533,7 +1170,7 @@ fn is_guide_atom(atom: &crate::core::atom::AtomInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::atom::{AtomInfo, REP_LINES};
+    use crate::core::atom::{AtomInfo, REP_LINES, REP_STICKS};
     use crate::core::molecule::Molecule;
 
     fn test_molecule() -> Molecule {
@@ -588,10 +1225,47 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_flags_masked_and_protected() {
+        let mut mol = test_molecule();
+        mol.atoms[0].flags = 1 << 25;
+        mol.atoms[1].flags = (1 << 31) | (1 << 3);
+        mol.atoms[2].flags = 1 << 2;
+        mol.atoms[1].masked = true;
+        mol.atoms[2].protected = true;
+
+        assert_eq!(
+            evaluate(&Selector::Flag(25), &mol),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Flag(31), &mol),
+            vec![false, true, false]
+        );
+        assert_eq!(evaluate(&Selector::Flag(3), &mol), vec![false, true, false]);
+        assert_eq!(evaluate(&Selector::Flag(2), &mol), vec![false, false, true]);
+        assert_eq!(evaluate(&Selector::Masked, &mol), vec![false, true, false]);
+        assert_eq!(
+            evaluate(&Selector::Protected, &mol),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
     fn evaluate_serial_range() {
-        let mol = test_molecule();
+        let mut mol = test_molecule();
+        mol.atoms[0].rank = 3;
+        mol.atoms[1].rank = 1;
+        mol.atoms[2].rank = 2;
         let serial = evaluate(&Selector::Serial(11, 12), &mol);
         assert_eq!(serial, vec![false, true, true]);
+        let index = evaluate(&Selector::Index(1, 2), &mol);
+        assert_eq!(index, vec![true, true, false]);
+        let rank = evaluate(&Selector::Rank(1, 2), &mol);
+        assert_eq!(rank, vec![false, true, true]);
+
+        mol.atoms[1].serial = 0;
+        let id_fallback = evaluate(&Selector::Serial(2, 2), &mol);
+        assert_eq!(id_fallback, vec![false, true, false]);
     }
 
     #[test]
@@ -610,19 +1284,110 @@ mod tests {
             evaluate(&Selector::ChainPattern("Z*".to_string()), &mol),
             vec![false, false, false]
         );
+        assert_eq!(
+            evaluate(&Selector::ChainPattern("A:C".to_string()), &mol),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::ChainPattern("A:C+Z*".to_string()), &mol),
+            vec![true, true, true]
+        );
+    }
+
+    #[test]
+    fn evaluate_segi_selector() {
+        let mut mol = test_molecule();
+        mol.atoms[0].segi = "PROA".to_string();
+        mol.atoms[1].segi = "PROA".to_string();
+        mol.atoms[2].segi = "LIG".to_string();
+
+        assert_eq!(
+            evaluate(&Selector::Segi("PRO*".to_string()), &mol),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Segi("PROA+LIG".to_string()), &mol),
+            vec![true, true, true]
+        );
     }
 
     #[test]
     fn evaluate_plus_separated_numeric_lists() {
-        let mol = test_molecule();
+        let mut mol = test_molecule();
+        mol.atoms[0].numeric_type = 10;
+        mol.atoms[1].numeric_type = 20;
+        mol.atoms[2].numeric_type = 25;
 
         assert_eq!(
-            evaluate(&Selector::ResiList(vec![(2, 2), (4, 4)]), &mol),
+            evaluate(
+                &Selector::ResiList(vec![(2, 2, None, None), (4, 4, None, None)]),
+                &mol
+            ),
             vec![false, false, true]
         );
         assert_eq!(
             evaluate(&Selector::SerialList(vec![(10, 10), (12, 12)]), &mol),
             vec![true, false, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::IndexList(vec![(1, 1), (3, 3)]), &mol),
+            vec![true, false, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::NumericType(vec![(10, 10), (20, 30)]), &mol),
+            vec![true, true, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::NumericType(vec![(-9999, -9999)]), &mol),
+            vec![false, false, false]
+        );
+    }
+
+    #[test]
+    fn evaluate_resi_with_insertion_code() {
+        let mut mol = Molecule::new("test".into());
+        mol.atoms.push(AtomInfo {
+            resi: 9,
+            ins_code: 'A',
+            ..AtomInfo::default()
+        });
+        mol.atoms.push(AtomInfo {
+            resi: 9,
+            ins_code: 'B',
+            ..AtomInfo::default()
+        });
+        mol.atoms.push(AtomInfo {
+            resi: 9,
+            ..AtomInfo::default()
+        });
+        mol.atoms.push(AtomInfo {
+            resi: 10,
+            ins_code: 'A',
+            ..AtomInfo::default()
+        });
+
+        assert_eq!(
+            evaluate(&Selector::Resi(9, 9, None, None), &mol),
+            vec![true, true, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Resi(9, 9, Some('A'), Some('A')), &mol),
+            vec![true, false, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Resi(9, 9, Some('B'), Some('B')), &mol),
+            vec![false, true, false, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::ResiList(vec![(9, 9, Some('A'), Some('A')), (10, 10, None, None)]),
+                &mol
+            ),
+            vec![true, false, false, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::Resi(9, 10, Some('A'), Some('A')), &mol),
+            vec![true, true, false, true]
         );
     }
 
@@ -684,6 +1449,9 @@ mod tests {
         mol.atoms[0].color = [1.0, 0.2, 0.2];
         mol.atoms[1].color = [0.5, 0.5, 0.5];
         mol.atoms[2].color = [0.2, 0.2, 1.0];
+        mol.atoms[0].cartoon_color = Some([0.2, 0.2, 1.0]);
+        mol.atoms[1].ribbon_color = Some([1.0, 0.2, 0.2]);
+        mol.atoms[2].cartoon_color = Some([0.5, 0.5, 0.5]);
 
         assert_eq!(
             evaluate(&Selector::Color("red".to_string()), &mol),
@@ -697,6 +1465,22 @@ mod tests {
             evaluate(&Selector::Color("unknown".to_string()), &mol),
             vec![false, false, false]
         );
+        assert_eq!(
+            evaluate(&Selector::CartoonColor("blue".to_string()), &mol),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::CartoonColor("grey".to_string()), &mol),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::RibbonColor("red".to_string()), &mol),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::RibbonColor("blue".to_string()), &mol),
+            vec![false, false, false]
+        );
     }
 
     #[test]
@@ -708,6 +1492,43 @@ mod tests {
         mol.atoms[0].occupancy = 0.25;
         mol.atoms[1].occupancy = 0.5;
         mol.atoms[2].occupancy = 1.0;
+        mol.atoms[0].formal_charge = -1;
+        mol.atoms[1].formal_charge = 0;
+        mol.atoms[2].formal_charge = 1;
+        mol.atoms[0].partial_charge = -0.3;
+        mol.atoms[1].partial_charge = 0.0;
+        mol.atoms[2].partial_charge = 0.2;
+        mol.atoms[0].vdw = 1.5;
+        mol.atoms[1].vdw = 1.7;
+        mol.atoms[2].vdw = 2.0;
+        mol.atoms[0].elec_radius = 1.1;
+        mol.atoms[1].elec_radius = 1.3;
+        mol.atoms[2].elec_radius = 1.5;
+        mol.atoms[0].cartoon = 0;
+        mol.atoms[1].cartoon = 2;
+        mol.atoms[2].cartoon = 3;
+        mol.atoms[0].geom = 1;
+        mol.atoms[1].geom = 3;
+        mol.atoms[2].geom = 4;
+        mol.atoms[0].valence = 1;
+        mol.atoms[1].valence = 3;
+        mol.atoms[2].valence = 4;
+        mol.atoms[0].vis_rep = REP_LINES;
+        mol.atoms[1].vis_rep = REP_STICKS;
+        mol.atoms[2].vis_rep = REP_LINES | REP_STICKS;
+        mol.atoms[0].flags = 0;
+        mol.atoms[1].flags = 1 << 2;
+        mol.atoms[2].flags = 1 << 3;
+        mol.bonds.push(crate::core::bond::BondInfo {
+            atom_a: 0,
+            atom_b: 1,
+            order: 1,
+        });
+        mol.bonds.push(crate::core::bond::BondInfo {
+            atom_a: 1,
+            atom_b: 2,
+            order: 2,
+        });
 
         assert_eq!(
             evaluate(
@@ -722,6 +1543,104 @@ mod tests {
                 &mol,
             ),
             vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::FormalCharge, CompareOp::Equal, -1.0),
+                &mol,
+            ),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::FormalCharge, CompareOp::GreaterEqual, 0.0),
+                &mol,
+            ),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::PartialCharge, CompareOp::Less, -0.1),
+                &mol,
+            ),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::PartialCharge, CompareOp::Greater, 0.1),
+                &mol,
+            ),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Vdw, CompareOp::LessEqual, 1.7),
+                &mol,
+            ),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::ElecRadius, CompareOp::Greater, 1.2),
+                &mol,
+            ),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Cartoon, CompareOp::GreaterEqual, 2.0),
+                &mol,
+            ),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Geom, CompareOp::Equal, 3.0),
+                &mol,
+            ),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Valence, CompareOp::Less, 4.0),
+                &mol,
+            ),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Reps, CompareOp::Equal, REP_STICKS as f32),
+                &mol,
+            ),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Protons, CompareOp::Equal, 6.0),
+                &mol,
+            ),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::Flags, CompareOp::Greater, 0.0),
+                &mol,
+            ),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::ExplicitDegree, CompareOp::GreaterEqual, 2.0),
+                &mol,
+            ),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::ExplicitValence, CompareOp::Equal, 3.0),
+                &mol,
+            ),
+            vec![false, true, false]
         );
         assert_eq!(
             evaluate_with_coords(
@@ -742,8 +1661,158 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_hbond_and_delocalized_selectors() {
+        let mut mol = Molecule::new("chem".to_string());
+        mol.atoms = vec![
+            AtomInfo {
+                name: "N".to_string(),
+                elem_symbol: "N".to_string(),
+                element: 7,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "H".to_string(),
+                elem_symbol: "H".to_string(),
+                element: 1,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "O".to_string(),
+                elem_symbol: "O".to_string(),
+                element: 8,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "C1".to_string(),
+                elem_symbol: "C".to_string(),
+                element: 6,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "C2".to_string(),
+                elem_symbol: "C".to_string(),
+                element: 6,
+                ..AtomInfo::default()
+            },
+        ];
+        mol.coord_sets = vec![vec![[0.0; 3]; mol.atoms.len()]];
+        mol.bonds = vec![
+            crate::core::bond::BondInfo {
+                atom_a: 0,
+                atom_b: 1,
+                order: 1,
+            },
+            crate::core::bond::BondInfo {
+                atom_a: 3,
+                atom_b: 4,
+                order: 4,
+            },
+        ];
+
+        assert_eq!(
+            evaluate(&Selector::Donors, &mol),
+            vec![true, false, false, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Acceptors, &mol),
+            vec![false, false, true, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Delocalized, &mol),
+            vec![false, false, false, true, true]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::Property(AtomProperty::ExplicitValence, CompareOp::Equal, 1.5),
+                &mol,
+            ),
+            vec![false, false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn evaluate_custom_property_selectors() {
+        let mut mol = test_molecule();
+        mol.atoms[0]
+            .properties
+            .insert("score".to_string(), "0.75".to_string());
+        mol.atoms[1]
+            .properties
+            .insert("score".to_string(), "0.25".to_string());
+        mol.atoms[2]
+            .properties
+            .insert("score".to_string(), "inactive".to_string());
+        mol.atoms[0]
+            .properties
+            .insert("kind".to_string(), "ligand_core".to_string());
+        mol.atoms[1]
+            .properties
+            .insert("kind".to_string(), "ligand_tail".to_string());
+        mol.atoms[2]
+            .properties
+            .insert("kind".to_string(), "solvent".to_string());
+
+        assert_eq!(
+            evaluate(
+                &Selector::CustomProperty(
+                    "score".to_string(),
+                    CustomPropertyOp::GreaterEqual,
+                    "0.5".to_string(),
+                ),
+                &mol,
+            ),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::CustomProperty(
+                    "score".to_string(),
+                    CustomPropertyOp::Less,
+                    "0.5".to_string(),
+                ),
+                &mol,
+            ),
+            vec![false, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::CustomProperty(
+                    "kind".to_string(),
+                    CustomPropertyOp::In,
+                    "ligand_*".to_string(),
+                ),
+                &mol,
+            ),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(
+                &Selector::CustomProperty(
+                    "missing".to_string(),
+                    CustomPropertyOp::In,
+                    "*".to_string(),
+                ),
+                &mol,
+            ),
+            vec![false, false, false]
+        );
+    }
+
+    #[test]
     fn evaluate_plus_separated_alpha_lists() {
-        let mol = test_molecule();
+        let mut mol = test_molecule();
+        mol.atoms[0].text_type = "CT".to_string();
+        mol.atoms[1].text_type = "HC".to_string();
+        mol.atoms[2].text_type = "OW".to_string();
+        mol.atoms[0].custom = "ligand_core".to_string();
+        mol.atoms[1].custom = "ligand_tail".to_string();
+        mol.atoms[2].custom = "solvent".to_string();
+        mol.atoms[0].label = "active_site".to_string();
+        mol.atoms[1].label = "active_ligand".to_string();
+        mol.atoms[2].label = "bulk".to_string();
+        mol.atoms[0].stereo = "R".to_string();
+        mol.atoms[1].stereo = "S".to_string();
+        mol.atoms[2].stereo = "odd".to_string();
 
         assert_eq!(
             evaluate(&Selector::Name("N+CA".to_string()), &mol),
@@ -761,11 +1830,72 @@ mod tests {
             evaluate(&Selector::Elem("O+S".to_string()), &mol),
             vec![false, false, false]
         );
+        assert_eq!(
+            evaluate(&Selector::TextType("CT+HC".to_string()), &mol),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Custom("ligand_*".to_string()), &mol),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Label("active_*".to_string()), &mol),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Stereo("R+S".to_string()), &mol),
+            vec![true, true, false]
+        );
+    }
+
+    #[test]
+    fn evaluate_pepseq_selector() {
+        let mut mol = Molecule::new("pep".to_string());
+        let residues = [("ALA", 1), ("GLY", 2), ("SER", 3), ("ALA", 4)];
+        for (resn, resi) in residues {
+            mol.atoms.push(AtomInfo {
+                name: "N".to_string(),
+                element: 7,
+                resn: resn.to_string(),
+                resi,
+                chain: 'A',
+                ..AtomInfo::default()
+            });
+            mol.atoms.push(AtomInfo {
+                name: "CA".to_string(),
+                element: 6,
+                resn: resn.to_string(),
+                resi,
+                chain: 'A',
+                ..AtomInfo::default()
+            });
+        }
+        mol.coord_sets = vec![vec![[0.0; 3]; mol.atoms.len()]];
+
+        assert_eq!(
+            evaluate(&Selector::Pepseq("AG".to_string()), &mol),
+            vec![true, true, true, true, false, false, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Pepseq("A+S".to_string()), &mol),
+            vec![true, true, true, true, true, true, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Pepseq("A-S".to_string()), &mol),
+            vec![true, true, false, false, true, true, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Pepseq("WG".to_string()), &mol),
+            vec![false; 8]
+        );
     }
 
     #[test]
     fn evaluate_wildcard_alpha_lists() {
-        let mol = test_molecule();
+        let mut mol = test_molecule();
+        mol.atoms[0].text_type = "CT".to_string();
+        mol.atoms[1].text_type = "HC".to_string();
+        mol.atoms[2].text_type = "OW".to_string();
 
         assert_eq!(
             evaluate(&Selector::Name("C*".to_string()), &mol),
@@ -778,6 +1908,14 @@ mod tests {
         assert_eq!(
             evaluate(&Selector::Elem("C*".to_string()), &mol),
             vec![false, true, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::TextType("?C".to_string()), &mol),
+            vec![false, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::TextType("*C".to_string()), &mol),
+            vec![false, true, false]
         );
     }
 
@@ -803,6 +1941,32 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_named_selection_selector() {
+        let mut mol = test_molecule();
+        mol.name = "obj".to_string();
+        let key = named_selection_property_key("stored");
+        mol.atoms[0].properties.insert(key.clone(), "1".to_string());
+        mol.atoms[2].properties.insert(key, "1".to_string());
+
+        assert_eq!(
+            evaluate(&Selector::Named("stored".to_string()), &mol),
+            vec![true, false, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::Named("missing".to_string()), &mol),
+            vec![false, false, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::Identifier("stored".to_string()), &mol),
+            vec![true, false, true]
+        );
+        assert_eq!(
+            evaluate(&Selector::Identifier("obj".to_string()), &mol),
+            vec![true, true, true]
+        );
+    }
+
+    #[test]
     fn evaluate_present_selector() {
         let mol = test_molecule();
 
@@ -812,6 +1976,22 @@ mod tests {
         );
         assert_eq!(
             evaluate_with_coords(&Selector::Present, &mol, &[]),
+            vec![false, false, false]
+        );
+    }
+
+    #[test]
+    fn evaluate_state_selector() {
+        let mol = test_molecule();
+
+        assert_eq!(evaluate(&Selector::State(1), &mol), vec![true, true, true]);
+        assert_eq!(evaluate(&Selector::State(2), &mol), vec![true, true, true]);
+        assert_eq!(
+            evaluate_with_coords(&Selector::State(-1), &mol, &mol.coord_sets[0][..2]),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            evaluate(&Selector::State(3), &mol),
             vec![false, false, false]
         );
     }
@@ -974,6 +2154,21 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_gap_selector_uses_vdw_clearance() {
+        let mut mol = test_molecule();
+        mol.atoms[0].vdw = 1.0;
+        mol.atoms[1].vdw = 1.0;
+        mol.atoms[2].vdw = 1.0;
+        mol.coord_sets = vec![vec![[0.0, 0.0, 0.0], [2.5, 0.0, 0.0], [4.5, 0.0, 0.0]]];
+
+        let gap = Selector::Gap(1.0, Box::new(Selector::Serial(10, 10)));
+        assert_eq!(evaluate(&gap, &mol), vec![false, false, true]);
+
+        let no_extra_gap = Selector::Gap(0.0, Box::new(Selector::Serial(10, 10)));
+        assert_eq!(evaluate(&no_extra_gap, &mol), vec![false, true, true]);
+    }
+
+    #[test]
     fn evaluate_around_expand_and_extend_selectors() {
         let mut mol = test_molecule();
         mol.bonds.push(crate::core::bond::BondInfo {
@@ -1015,6 +2210,71 @@ mod tests {
         );
         let second_state = evaluate_with_coords(&sel, &mol, &mol.coord_sets[1]);
         assert_eq!(second_state, vec![true, true, false]);
+    }
+
+    #[test]
+    fn evaluate_in_like_and_subtract_operators() {
+        let mut mol = Molecule::new("identity".to_string());
+        mol.atoms = vec![
+            AtomInfo {
+                name: "CA".to_string(),
+                resn: "ALA".to_string(),
+                resi: 1,
+                chain: 'A',
+                segi: "S1".to_string(),
+                serial: 10,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "CA".to_string(),
+                resn: "ALA".to_string(),
+                resi: 2,
+                chain: 'A',
+                segi: "S1".to_string(),
+                serial: 11,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "CA".to_string(),
+                resn: "ALA".to_string(),
+                resi: 1,
+                chain: 'B',
+                segi: "S2".to_string(),
+                serial: 12,
+                ..AtomInfo::default()
+            },
+            AtomInfo {
+                name: "CA".to_string(),
+                resn: "ALA".to_string(),
+                resi: 1,
+                chain: 'A',
+                segi: "S1".to_string(),
+                serial: 13,
+                ..AtomInfo::default()
+            },
+        ];
+        mol.coord_sets = vec![vec![[0.0; 3]; mol.atoms.len()]];
+
+        let in_sel = Selector::In(
+            Box::new(Selector::SerialList(vec![(10, 12)])),
+            Box::new(Selector::Serial(13, 13)),
+        );
+        assert_eq!(evaluate(&in_sel, &mol), vec![true, false, false, false]);
+
+        let like_sel = Selector::Like(
+            Box::new(Selector::SerialList(vec![(10, 12)])),
+            Box::new(Selector::Serial(13, 13)),
+        );
+        assert_eq!(evaluate(&like_sel, &mol), vec![true, false, true, false]);
+
+        let subtract_sel = Selector::And(
+            Box::new(Selector::All),
+            Box::new(Selector::Not(Box::new(Selector::Chain('A')))),
+        );
+        assert_eq!(
+            evaluate(&subtract_sel, &mol),
+            vec![false, false, true, false]
+        );
     }
 
     #[test]
@@ -1075,6 +2335,9 @@ mod tests {
 
         let sel2 = Selector::Neighbor(Box::new(Selector::Serial(11, 12)));
         assert_eq!(evaluate(&sel2, &mol), vec![true, false, false]);
+
+        let bound_to = Selector::BoundTo(Box::new(Selector::Serial(11, 12)));
+        assert_eq!(evaluate(&bound_to, &mol), vec![true, true, true]);
     }
 
     #[test]
@@ -1091,6 +2354,30 @@ mod tests {
 
         let sel = Selector::Byres(Box::new(Selector::Serial(10, 10)));
         assert_eq!(evaluate(&sel, &mol), vec![true, true, false, true]);
+    }
+
+    #[test]
+    fn evaluate_byres_keeps_segments_separate() {
+        let mut mol = Molecule::new("segments".to_string());
+        mol.atoms.push(AtomInfo {
+            serial: 1,
+            chain: 'A',
+            segi: "A".to_string(),
+            resi: 1,
+            ..AtomInfo::default()
+        });
+        mol.atoms.push(AtomInfo {
+            serial: 2,
+            chain: 'A',
+            segi: "B".to_string(),
+            resi: 1,
+            ..AtomInfo::default()
+        });
+
+        assert_eq!(
+            evaluate(&Selector::Byres(Box::new(Selector::Serial(1, 1))), &mol),
+            vec![true, false]
+        );
     }
 
     #[test]
@@ -1140,6 +2427,12 @@ mod tests {
         let bychain = Selector::Bychain(Box::new(Selector::Serial(10, 10)));
         assert_eq!(evaluate(&bychain, &mol), vec![true, true, false]);
 
+        mol.atoms[0].segi = "PROA".to_string();
+        mol.atoms[1].segi = "PROA".to_string();
+        mol.atoms[2].segi = "LIG".to_string();
+        let bysegment = Selector::Bysegment(Box::new(Selector::Serial(10, 10)));
+        assert_eq!(evaluate(&bysegment, &mol), vec![true, true, false]);
+
         let byobject = Selector::Byobject(Box::new(Selector::Serial(12, 12)));
         assert_eq!(evaluate(&byobject, &mol), vec![true, true, true]);
 
@@ -1154,6 +2447,54 @@ mod tests {
             evaluate(&bymolecule_isolated, &mol),
             vec![false, false, true]
         );
+    }
+
+    #[test]
+    fn evaluate_byring_selector() {
+        let mut mol = Molecule::new("rings".into());
+        for serial in 1..=10 {
+            mol.atoms.push(AtomInfo {
+                serial,
+                ..AtomInfo::default()
+            });
+        }
+
+        let bonds = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 5),
+            (5, 0),
+            (0, 6),
+            (6, 7),
+            (7, 8),
+            (8, 6),
+            (8, 9),
+        ];
+        mol.bonds = bonds
+            .iter()
+            .map(|&(atom_a, atom_b)| crate::core::bond::BondInfo {
+                atom_a,
+                atom_b,
+                order: 1,
+            })
+            .collect();
+
+        let benzene_like = Selector::Byring(Box::new(Selector::Serial(1, 1)));
+        assert_eq!(
+            evaluate(&benzene_like, &mol),
+            vec![true, true, true, true, true, true, false, false, false, false]
+        );
+
+        let three_membered = Selector::Byring(Box::new(Selector::Serial(8, 8)));
+        assert_eq!(
+            evaluate(&three_membered, &mol),
+            vec![false, false, false, false, false, false, true, true, true, false]
+        );
+
+        let acyclic = Selector::Byring(Box::new(Selector::Serial(10, 10)));
+        assert_eq!(evaluate(&acyclic, &mol), vec![false; 10]);
     }
 
     #[test]

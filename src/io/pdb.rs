@@ -18,6 +18,7 @@ pub struct PdbWriteSource<'a> {
 struct AtomIdentity {
     is_hetatm: bool,
     chain: char,
+    segi: String,
     resn: String,
     resi: i32,
     ins_code: char,
@@ -105,10 +106,12 @@ fn format_pdb_atom_line(serial: u32, atom: &AtomInfo, coord: [f32; 3]) -> String
     let resn = truncate_ascii(&atom.resn, 3);
     let chain = pdb_char(atom.chain, ' ');
     let ins = pdb_char(atom.ins_code, ' ');
+    let segi = truncate_ascii(&atom.segi, 4);
     let elem = truncate_ascii(&atom.elem_symbol, 2);
+    let charge = format_pdb_charge(atom.formal_charge);
     format!(
         "{record}{serial:>5} {name}{alt}{resn:>3} {chain}{resi:>4}{ins}   \
-         {x:>8.3}{y:>8.3}{z:>8.3}{occ:>6.2}{b:>6.2}          {elem:>2}",
+         {x:>8.3}{y:>8.3}{z:>8.3}{occ:>6.2}{b:>6.2}      {segi:<4}{elem:>2}{charge}",
         record = record,
         serial = serial.min(99999),
         name = name,
@@ -117,12 +120,14 @@ fn format_pdb_atom_line(serial: u32, atom: &AtomInfo, coord: [f32; 3]) -> String
         chain = chain,
         resi = atom.resi.clamp(-999, 9999),
         ins = ins,
+        segi = segi,
         x = coord[0],
         y = coord[1],
         z = coord[2],
         occ = atom.occupancy,
         b = atom.b_factor,
         elem = elem,
+        charge = charge,
     )
 }
 
@@ -146,6 +151,41 @@ fn pdb_char(ch: char, default: char) -> char {
     } else {
         ch
     }
+}
+
+fn parse_pdb_charge(raw: &str) -> i8 {
+    let raw = raw.trim();
+    if raw.len() != 2 {
+        return 0;
+    }
+
+    let mut chars = raw.chars();
+    let first = chars.next().unwrap_or(' ');
+    let second = chars.next().unwrap_or(' ');
+    let (digit, sign) = if first.is_ascii_digit() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+
+    let Some(magnitude) = digit.to_digit(10) else {
+        return 0;
+    };
+    match sign {
+        '+' => magnitude as i8,
+        '-' => -(magnitude as i8),
+        _ => 0,
+    }
+}
+
+fn format_pdb_charge(charge: i8) -> String {
+    if charge == 0 {
+        return "  ".to_string();
+    }
+
+    let magnitude = charge.unsigned_abs().min(9);
+    let sign = if charge > 0 { '+' } else { '-' };
+    format!("{magnitude}{sign}")
 }
 
 /// Parse PDB content from a string.
@@ -223,10 +263,12 @@ pub fn parse_pdb_string(content: &str, path: &Path) -> Result<LoadResult, String
     if let Some(first_state) = state_rows.first() {
         let mut serial_to_idx: HashMap<u32, usize> = HashMap::new();
         mol.atoms = Vec::with_capacity(first_state.len());
-        for row in first_state {
+        for (rank_idx, row) in first_state.iter().enumerate() {
             let idx = mol.atoms.len();
             serial_to_idx.insert(row.serial, idx);
-            mol.atoms.push(row.atom.clone());
+            let mut atom = row.atom.clone();
+            atom.rank = (rank_idx + 1) as u32;
+            mol.atoms.push(atom);
         }
         mol.coord_sets = vec![first_state.iter().map(|r| r.coord).collect()];
 
@@ -325,7 +367,9 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
     // 47-54  z
     // 55-60  occupancy
     // 61-66  bfactor
+    // 73-76  segment identifier
     // 77-78  element symbol
+    // 79-80  formal charge
     let bytes = line.as_bytes();
     let get = |start: usize, end: usize| -> &str {
         if end <= bytes.len() {
@@ -341,6 +385,7 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
     let alt = if alt_raw == ' ' { ' ' } else { alt_raw };
     let resn = get(17, 20).to_string();
     let chain = bytes.get(21).map(|&b| b as char).unwrap_or(' ');
+    let segi = get(72, 76).to_string();
     let resi: i32 = get(22, 26).parse().ok()?;
     let ins_raw = bytes.get(26).map(|&b| b as char).unwrap_or(' ');
     let ins_code = if ins_raw == ' ' { '\0' } else { ins_raw };
@@ -351,6 +396,7 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
 
     let occupancy: f32 = get(54, 60).parse().unwrap_or(1.0);
     let b_factor: f32 = get(60, 66).parse().unwrap_or(0.0);
+    let formal_charge = parse_pdb_charge(get(78, 80));
 
     // Element symbol: columns 77-78, or fall back to first non-digit char of atom name.
     let elem_sym = {
@@ -386,9 +432,11 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
         resi,
         ins_code,
         chain,
+        segi: segi.clone(),
         alt,
         b_factor,
         occupancy,
+        formal_charge,
         vdw,
         color,
         is_hetatm,
@@ -399,6 +447,7 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Option<ParsedAtom> {
     let identity = AtomIdentity {
         is_hetatm,
         chain,
+        segi,
         resn,
         resi,
         ins_code,
@@ -691,9 +740,11 @@ mod tests {
             resn: "ALA".to_string(),
             resi: 1,
             chain: 'A',
+            segi: "PROA".to_string(),
             serial: 10,
             occupancy: 0.5,
             b_factor: 12.5,
+            formal_charge: 1,
             ..AtomInfo::default()
         });
         mol.atoms.push(AtomInfo {
@@ -737,11 +788,64 @@ mod tests {
         assert_eq!(atom_count, 2);
         assert!(pdb.starts_with("ATOM  "));
         assert!(pdb.contains(" ALA A   1 "));
+        assert!(pdb.lines().next().unwrap().contains("PROA C"));
+        assert!(pdb.lines().next().unwrap().ends_with("1+"));
         assert!(pdb.contains("   1.000   2.000   3.000"));
         assert!(pdb.contains("  0.50 12.50"));
         assert!(pdb.contains("CONECT    1    2"));
         assert!(pdb.ends_with("END\n"));
         assert!(!pdb.contains("HOH"));
         assert!(!pdb.contains("CONECT    2    3"));
+    }
+
+    #[test]
+    fn pdb_parses_segment_identifier() {
+        let mut mol = Molecule::new("segment".to_string());
+        mol.atoms.push(AtomInfo {
+            name: "CA".to_string(),
+            elem_symbol: "C".to_string(),
+            resn: "ALA".to_string(),
+            resi: 1,
+            chain: 'A',
+            segi: "PROA".to_string(),
+            serial: 1,
+            ..AtomInfo::default()
+        });
+        mol.coord_sets = vec![vec![[0.0, 0.0, 0.0]]];
+        let (pdb, atom_count) = format_pdb_sources(&[PdbWriteSource {
+            molecule: &mol,
+            coords: mol.coords_for_state(1),
+            mask: None,
+        }]);
+
+        assert_eq!(atom_count, 1);
+        let result = parse_pdb_string(&pdb, Path::new("segment.pdb")).unwrap();
+        assert_eq!(result.molecule.atoms[0].segi, "PROA");
+    }
+
+    #[test]
+    fn pdb_round_trips_formal_charge() {
+        let mut mol = Molecule::new("charge".to_string());
+        mol.atoms.push(AtomInfo {
+            name: "CL".to_string(),
+            elem_symbol: "Cl".to_string(),
+            resn: "LIG".to_string(),
+            resi: 1,
+            chain: 'A',
+            serial: 1,
+            formal_charge: -1,
+            ..AtomInfo::default()
+        });
+        mol.coord_sets = vec![vec![[0.0, 0.0, 0.0]]];
+        let (pdb, atom_count) = format_pdb_sources(&[PdbWriteSource {
+            molecule: &mol,
+            coords: mol.coords_for_state(1),
+            mask: None,
+        }]);
+
+        assert_eq!(atom_count, 1);
+        assert!(pdb.lines().next().unwrap().ends_with("1-"));
+        let result = parse_pdb_string(&pdb, Path::new("charge.pdb")).unwrap();
+        assert_eq!(result.molecule.atoms[0].formal_charge, -1);
     }
 }

@@ -11,6 +11,7 @@ use crate::io::LoadResult;
 struct AtomIdentity {
     is_hetatm: bool,
     chain: char,
+    segi: String,
     resn: String,
     resi: i32,
     ins_code: char,
@@ -62,7 +63,15 @@ pub fn parse_cif_string(content: &str, path: &Path) -> Result<LoadResult, String
     let source_model_count = state_rows.len();
 
     if let Some(first_state) = state_rows.first() {
-        mol.atoms = first_state.iter().map(|r| r.atom.clone()).collect();
+        mol.atoms = first_state
+            .iter()
+            .enumerate()
+            .map(|(rank_idx, r)| {
+                let mut atom = r.atom.clone();
+                atom.rank = (rank_idx + 1) as u32;
+                atom
+            })
+            .collect();
         mol.coord_sets = vec![first_state.iter().map(|r| r.coord).collect()];
 
         let mut mismatch = false;
@@ -168,6 +177,7 @@ fn parse_atom_site_loop(
     let c_chain = columns
         .get("_atom_site.auth_asym_id")
         .or(columns.get("_atom_site.label_asym_id"));
+    let c_segi = columns.get("_atom_site.pdbx_PDB_segment_id");
     let c_resi = columns
         .get("_atom_site.auth_seq_id")
         .or(columns.get("_atom_site.label_seq_id"));
@@ -178,6 +188,7 @@ fn parse_atom_site_loop(
     let c_z = columns.get("_atom_site.Cartn_z");
     let c_occ = columns.get("_atom_site.occupancy");
     let c_b = columns.get("_atom_site.B_iso_or_equiv");
+    let c_formal_charge = columns.get("_atom_site.pdbx_formal_charge");
     let c_id = columns.get("_atom_site.id");
     let c_model = columns.get("_atom_site.pdbx_PDB_model_num");
 
@@ -217,9 +228,7 @@ fn parse_atom_site_loop(
         }
         let is_hetatm = group == "HETATM";
 
-        let raw_model: i32 = c_model
-            .and_then(|&i| row[i].parse().ok())
-            .unwrap_or(1);
+        let raw_model: i32 = c_model.and_then(|&i| row[i].parse().ok()).unwrap_or(1);
         let state_id = if let Some(&existing) = model_to_state.get(&raw_model) {
             existing
         } else {
@@ -242,16 +251,27 @@ fn parse_atom_site_loop(
         let chain = c_chain
             .map(|&i| row[i].chars().next().unwrap_or(' '))
             .unwrap_or(' ');
+        let segi = c_segi
+            .map(|&i| normalize_cif_text(row[i]))
+            .unwrap_or_default();
         let resi = parse_cif_int(c_resi.map(|&i| row[i]).unwrap_or("0"));
         let ins_code = parse_cif_code(c_ins.map(|&i| row[i]).unwrap_or("?"), '\0');
         let alt = parse_cif_code(c_alt.map(|&i| row[i]).unwrap_or("?"), ' ');
         let occupancy: f32 = c_occ.and_then(|&i| row[i].parse().ok()).unwrap_or(1.0);
         let b_factor: f32 = c_b.and_then(|&i| row[i].parse().ok()).unwrap_or(0.0);
+        let formal_charge: i8 = c_formal_charge
+            .and_then(|&i| parse_cif_optional_i8(row[i]))
+            .unwrap_or(0);
         let serial: u32 = c_id.and_then(|&i| row[i].parse().ok()).unwrap_or(0);
 
         let elem_data = element_by_symbol(&elem_sym);
         let atomic_number = elem_data
-            .map(|e| ELEMENTS.iter().position(|x| std::ptr::eq(x, e)).unwrap_or(0) as u8)
+            .map(|e| {
+                ELEMENTS
+                    .iter()
+                    .position(|x| std::ptr::eq(x, e))
+                    .unwrap_or(0) as u8
+            })
             .unwrap_or(0);
         let vdw = elem_data.map(|e| e.vdw).unwrap_or(1.7);
         let color = elem_data.map(|e| e.color).unwrap_or([0.5, 0.5, 0.5]);
@@ -264,9 +284,11 @@ fn parse_atom_site_loop(
             resi,
             ins_code,
             chain,
+            segi: segi.clone(),
             alt,
             b_factor,
             occupancy,
+            formal_charge,
             vdw,
             color,
             is_hetatm,
@@ -277,6 +299,7 @@ fn parse_atom_site_loop(
         let identity = AtomIdentity {
             is_hetatm,
             chain,
+            segi,
             resn,
             resi,
             ins_code,
@@ -307,6 +330,22 @@ fn parse_cif_code(s: &str, default: char) -> char {
         default
     } else {
         s.chars().next().unwrap_or(default)
+    }
+}
+
+fn parse_cif_optional_i8(s: &str) -> Option<i8> {
+    if s == "." || s == "?" || s.is_empty() {
+        None
+    } else {
+        s.parse().ok()
+    }
+}
+
+fn normalize_cif_text(s: &str) -> String {
+    if s == "." || s == "?" {
+        String::new()
+    } else {
+        s.to_string()
     }
 }
 
@@ -486,5 +525,51 @@ mod tests {
         assert_eq!(result.source_model_count, 2);
         assert_eq!(result.molecule.state_count(), 1);
         assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn cif_parses_segment_identifier_when_present() {
+        let cif = "data_test\n\
+             loop_\n\
+             _atom_site.group_PDB\n\
+             _atom_site.id\n\
+             _atom_site.type_symbol\n\
+             _atom_site.label_atom_id\n\
+             _atom_site.label_comp_id\n\
+             _atom_site.auth_asym_id\n\
+             _atom_site.auth_seq_id\n\
+             _atom_site.pdbx_PDB_segment_id\n\
+             _atom_site.Cartn_x\n\
+             _atom_site.Cartn_y\n\
+             _atom_site.Cartn_z\n\
+             _atom_site.occupancy\n\
+             _atom_site.B_iso_or_equiv\n\
+             ATOM 1 C CA ALA A 1 PROA 0.0 0.0 0.0 1.0 10.0\n";
+
+        let result = parse_cif_string(cif, Path::new("segment.cif")).unwrap();
+        assert_eq!(result.molecule.atoms[0].segi, "PROA");
+    }
+
+    #[test]
+    fn cif_parses_formal_charge_when_present() {
+        let cif = "data_test\n\
+             loop_\n\
+             _atom_site.group_PDB\n\
+             _atom_site.id\n\
+             _atom_site.type_symbol\n\
+             _atom_site.label_atom_id\n\
+             _atom_site.label_comp_id\n\
+             _atom_site.auth_asym_id\n\
+             _atom_site.auth_seq_id\n\
+             _atom_site.pdbx_formal_charge\n\
+             _atom_site.Cartn_x\n\
+             _atom_site.Cartn_y\n\
+             _atom_site.Cartn_z\n\
+             _atom_site.occupancy\n\
+             _atom_site.B_iso_or_equiv\n\
+             ATOM 1 CL CL LIG A 1 -1 0.0 0.0 0.0 1.0 10.0\n";
+
+        let result = parse_cif_string(cif, Path::new("charge.cif")).unwrap();
+        assert_eq!(result.molecule.atoms[0].formal_charge, -1);
     }
 }
